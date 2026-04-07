@@ -191,7 +191,7 @@ router.delete('/:id', async (req, res) => {
 
         const allowedRoles = ['Super Admin', 'Supervisors', 'TSP'];
         if (!allowedRoles.includes(userRole)) {
-            return res.status(403).json({ success: false, message: "Unauthorized to delete records." });
+            return res.status(403).json({ success: false, message: "Unauthorized to delete record." });
         }
 
         const { error } = await supabase
