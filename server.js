@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const supabase = require('./supabaseClient');
+const mysqlPool = require('./mysqlClient'); // ✅ NEW
 
 // --- ROUTE IMPORTS ---
 const authRoutes = require('./routes/authRoutes');
@@ -20,6 +21,7 @@ const bonusRoutes = require('./routes/bonusRoutes');
 const logRoutes = require('./routes/logRoutes');
 const otherLogRoutes = require('./routes/otherLogRoutes');
 const feedbackRoutes = require("./routes/feedbackRoutes");
+const attendanceRoutes = require('./routes/attendanceRoutes');
 
 const app = express();
 
@@ -50,19 +52,26 @@ app.use(cors({
 // --- 3. GLOBAL MIDDLEWARE ---
 app.use(express.json());
 
-// --- 4. HEALTH CHECK ---
+// --- 4. UPDATED HEALTH CHECK ---
 app.get('/api/test-connection', async (req, res) => {
     try {
-        const { count, error } = await supabase
-            .from('employees')
-            .select('*', { count: 'exact', head: true });
+        // Test Supabase
+        const { count } = await supabase.from('employees').select('*', { count: 'exact', head: true });
         
-        if (error) throw error;
-        res.json({ success: true, message: "Backend Live & Supabase Connected", rowCount: count || 0 });
+        // Test MySQL
+        const [mysqlResult] = await mysqlPool.query('SELECT 1 + 1 AS solution');
+        
+        res.json({ 
+            success: true, 
+            message: "All Databases Connected", 
+            supabaseRows: count || 0,
+            mysqlStatus: mysqlResult ? "Online" : "Offline"
+        });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
     }
 });
+
 
 // --- 5. REGISTERED ROUTES ---
 app.use('/api/auth', authRoutes);
@@ -82,6 +91,7 @@ app.use('/api/reports', reportRoutes);
 app.use('/api/feedback', feedbackRoutes);
 app.use('/api/logs', logRoutes);
 app.use('/api/other-logs', otherLogRoutes);
+app.use('/api/attendance', attendanceRoutes);
 
 // --- 6. ERROR HANDLING ---
 app.use((req, res) => {
@@ -93,15 +103,21 @@ app.use((err, req, res, next) => {
     res.status(500).json({ success: false, message: "Internal Server Error" });
 });
 
-// --- 7. START SERVER ---
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
+    try {
+        // Simple query to verify MySQL is awake
+        await mysqlPool.query('SELECT 1');
+        console.log("    ✅ MySQL Localhost: Connected");
+    } catch (err) {
+        console.log("    ❌ MySQL Localhost: Connection Failed (" + err.message + ")");
+    }
+
     console.log(`
     🚀 TWS PORTAL BACKEND: ONLINE
     --------------------------------------------
-    📡 Local:            http://localhost:${PORT}
-    📊 Analytics API:     http://localhost:${PORT}/api/analytics/search
-    💬 Feedback API:      http://localhost:${PORT}/api/feedback
+    📡 Local:             http://localhost:${PORT}
+    📊 Analytics API:     http://localhost:${PORT}/api/analytics
     --------------------------------------------
     `);
 });
