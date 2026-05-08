@@ -1,6 +1,7 @@
 const express = require('express');
 const router = require('express').Router();
 const supabase = require('../supabaseClient');
+const db = require('../mysqlClient');
 
 router.get('/search', async (req, res) => {
     try {

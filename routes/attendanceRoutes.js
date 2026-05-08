@@ -5,11 +5,15 @@ const db = require('../mysqlClient');
 router.get('/', async (req, res) => {
     const { auth, employee_id } = req.query;
 
+    // --- HARDCODED SPECIAL EMPLOYEES ---
+    // Add the specific IDs here that should not follow shift rules
+    const specialEmployeeIds = ['1001', '1003']; 
+    const isSpecial = specialEmployeeIds.includes(String(employee_id));
+
     try {
         let query;
         let queryParams = [];
 
-        // Helper to extract shift code from JSON
         const getShiftSql = (dateCol, empIdCol) => `
             JSON_UNQUOTE(
                 JSON_EXTRACT(
@@ -21,12 +25,20 @@ router.get('/', async (req, res) => {
 
         if (auth === 'SUPER ADMIN') {
             /**
-             * SUPER ADMIN LOGIC: Unique Activity Stream
-             * Using DISTINCT to prevent the duplication seen in image_a127fc.png
+             * SUPER ADMIN VIEW: Raw Activity Stream
+             * Filters duplicates and labels special employees as N/A status.
              */
             query = `
-                SELECT * FROM (
-                    SELECT DISTINCT
+                SELECT 
+                    id, employee_id, employee_name, date, 
+                    check_in_time, check_out_time, shift_name,
+                    /* Hardcoded logic for Super Admin view status */
+                    CASE 
+                        WHEN employee_id IN (${specialEmployeeIds.map(id => `'${id}'`).join(',')}) THEN 'N/A'
+                        ELSE status
+                    END as status
+                FROM (
+                    SELECT 
                         ci.id, ci.employee_id, ci.employee_name,
                         DATE_FORMAT(ci.timestamp, '%d %M %Y') as date,
                         TIME_FORMAT(ci.timestamp, '%h:%i %p') as check_in_time,
@@ -39,7 +51,7 @@ router.get('/', async (req, res) => {
                     
                     UNION ALL
                     
-                    SELECT DISTINCT
+                    SELECT 
                         co.id, co.employee_id, co.employee_name,
                         DATE_FORMAT(co.timestamp, '%d %M %Y') as date,
                         '--:--' as check_in_time,
@@ -50,17 +62,17 @@ router.get('/', async (req, res) => {
                     FROM attendance_logs_check_out co
                     LEFT JOIN shift_assignments sa ON sa.month_year = DATE_FORMAT(co.timestamp, '%Y-%m')
                 ) combined_logs
-                GROUP BY employee_id, raw_time, status -- Extra layer of protection against dupes
+                GROUP BY employee_id, raw_time, status 
                 ORDER BY raw_time DESC
                 LIMIT 50
             `;
         } else {
-            /**
-             * EMPLOYEE LOGIC: Date-based pairing
-             * Preserving your existing working logic
-             */
             if (!employee_id) return res.status(400).json({ success: false, message: "ID required" });
 
+            /**
+             * EMPLOYEE VIEW: 
+             * If the ID is in the special list, we return 'N/A' for status.
+             */
             query = `
                 SELECT 
                     d.date,
@@ -68,6 +80,8 @@ router.get('/', async (req, res) => {
                     TIME_FORMAT(co.timestamp, '%h:%i %p') as check_out_time,
                     d.shift_code as shift_name,
                     CASE 
+                        /* Check if employee is in the hardcoded special list */
+                        WHEN ? IN (${specialEmployeeIds.map(id => `'${id}'`).join(',')}) THEN 'N/A'
                         WHEN ci.timestamp IS NOT NULL AND co.timestamp IS NOT NULL THEN 'Completed'
                         WHEN ci.timestamp IS NOT NULL THEN 'Check-in Only'
                         WHEN co.timestamp IS NOT NULL THEN 'Check-out Only'
@@ -108,5 +122,7 @@ router.get('/', async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
+
+
 
 module.exports = router;

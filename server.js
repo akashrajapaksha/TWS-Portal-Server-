@@ -22,6 +22,7 @@ const logRoutes = require('./routes/logRoutes');
 const otherLogRoutes = require('./routes/otherLogRoutes');
 const feedbackRoutes = require("./routes/feedbackRoutes");
 const attendanceRoutes = require('./routes/attendanceRoutes');
+const attendanceReportsRoute = require('./routes/attendanceReports');
 
 const app = express();
 
@@ -92,6 +93,7 @@ app.use('/api/feedback', feedbackRoutes);
 app.use('/api/logs', logRoutes);
 app.use('/api/other-logs', otherLogRoutes);
 app.use('/api/attendance', attendanceRoutes);
+app.use('/api/attendance-reports', attendanceReportsRoute);
 
 // --- 6. ERROR HANDLING ---
 app.use((req, res) => {
