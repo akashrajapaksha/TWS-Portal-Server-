@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const supabase = require('../supabaseClient');
+const db = require('../db'); // ✅ Pointing to your local MySQL Client
 
 /**
  * 🔒 FAIL-SAFE OTPLIB IMPORT
@@ -19,14 +19,18 @@ router.post('/login', async (req, res) => {
     }
 
     try {
-        const { data: user, error } = await supabase
-            .from('employees')
-            // Fetch ONLY what we need for the logic check
-            .select('id, email, password, role, name, employee_id, is_first_login, two_factor_secret')
-            .eq('email', email.toLowerCase().trim())
-            .maybeSingle();
+        // Query the local MySQL portal database
+        // ✅ UPDATED: Added profile_image to the SELECT fields
+        const queryStr = `
+            SELECT id, email, password, role, name, employee_id, is_first_login, two_factor_secret, profile_image 
+            FROM employees 
+            WHERE LOWER(TRIM(email)) = ? 
+            LIMIT 1
+        `;
+        const [rows] = await db.query(queryStr, [email.toLowerCase().trim()]);
+        const user = rows[0];
 
-        if (error || !user || user.password.trim() !== password.trim()) {
+        if (!user || user.password.trim() !== password.trim()) {
             return res.status(401).json({ success: false, message: "Invalid credentials." });
         }
 
@@ -34,11 +38,11 @@ router.post('/login', async (req, res) => {
 
         // --- ⭐ SUPER ADMIN BYPASS LOGIC ⭐ ---
         if (user.role === 'Super Admin') {
-            await supabase.from('login_logs').insert([{ 
-                employee_id: employeeId, 
-                employee_name: user.name || user.email,
-                login_time: new Date().toISOString()
-            }]);
+            const logQuery = `
+                INSERT INTO login_logs (employee_id, employee_name, login_time) 
+                VALUES (?, ?, NOW())
+            `;
+            await db.query(logQuery, [employeeId, user.name || user.email]);
 
             return res.status(200).json({
                 success: true,
@@ -49,10 +53,9 @@ router.post('/login', async (req, res) => {
                     role: user.role,
                     name: user.name,
                     employee_id: employeeId,
-                    is_first_login: user.is_first_login ?? false
+                    is_first_login: user.is_first_login ?? false,
+                    profile_image: user.profile_image // ✅ UPDATED: Include in response payload
                 }
-                // NOTICE: We do NOT return the 'user' object directly. 
-                // We construct a new object without the password.
             });
         }
         // --- END BYPASS ---
@@ -64,13 +67,16 @@ router.post('/login', async (req, res) => {
             });
         }
 
+        // Regular employees need 2FA. We pass the image back early 
+        // to cache temporarily in state if needed.
         return res.status(200).json({
             success: true,
             require2FA: true,
             user: {
                 employee_id: employeeId,
                 email: user.email,
-                name: user.name
+                name: user.name,
+                profile_image: user.profile_image // ✅ UPDATED: Pass to tempUser object state block
             }
         });
 
@@ -92,14 +98,17 @@ router.post('/verify-2fa', async (req, res) => {
     }
 
     try {
-        const { data: user, error } = await supabase
-            .from('employees')
-            // Fetch ONLY what is needed for verification and session
-            .select('id, email, role, name, employee_id, is_first_login, two_factor_secret')
-            .eq('employee_id', employee_id)
-            .single();
+        // ✅ UPDATED: Added profile_image to validation endpoint query pipeline
+        const queryStr = `
+            SELECT id, email, role, name, employee_id, is_first_login, two_factor_secret, profile_image 
+            FROM employees 
+            WHERE employee_id = ? 
+            LIMIT 1
+        `;
+        const [rows] = await db.query(queryStr, [employee_id]);
+        const user = rows[0];
 
-        if (error || !user || !user.two_factor_secret) {
+        if (!user || !user.two_factor_secret) {
             return res.status(404).json({ success: false, message: "User security data not found." });
         }
 
@@ -112,11 +121,11 @@ router.post('/verify-2fa', async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid or expired code." });
         }
 
-        await supabase.from('login_logs').insert([{ 
-            employee_id: user.employee_id, 
-            employee_name: user.name || user.email,
-            login_time: new Date().toISOString()
-        }]);
+        const logQuery = `
+            INSERT INTO login_logs (employee_id, employee_name, login_time) 
+            VALUES (?, ?, NOW())
+        `;
+        await db.query(logQuery, [user.employee_id, user.name || user.email]);
 
         return res.status(200).json({ 
             success: true, 
@@ -126,7 +135,8 @@ router.post('/verify-2fa', async (req, res) => {
                 role: user.role || 'Employees',
                 name: user.name,
                 employee_id: user.employee_id,
-                is_first_login: user.is_first_login ?? true
+                is_first_login: user.is_first_login ?? true,
+                profile_image: user.profile_image // ✅ UPDATED: Include in successful 2FA response payload
             }
         });
 
@@ -143,10 +153,12 @@ router.post('/logout', async (req, res) => {
     const { employee_id } = req.body;
     try {
         if (employee_id) {
-            await supabase
-                .from('employees')
-                .update({ last_logout: new Date().toISOString() })
-                .eq('employee_id', employee_id);
+            const logoutQuery = `
+                UPDATE employees 
+                SET last_logout = NOW() 
+                WHERE employee_id = ?
+            `;
+            await db.query(logoutQuery, [employee_id]);
         }
         return res.status(200).json({ success: true, message: "Logged out successfully" });
     } catch (err) {
@@ -161,23 +173,29 @@ router.post('/logout', async (req, res) => {
 router.post('/change-password', async (req, res) => {
     const { employee_id, currentPassword, newPassword } = req.body;
     try {
-        const { data: user } = await supabase
-            .from('employees')
-            .select('password')
-            .eq('employee_id', employee_id)
-            .single();
+        const checkQuery = `
+            SELECT password 
+            FROM employees 
+            WHERE employee_id = ? 
+            LIMIT 1
+        `;
+        const [rows] = await db.query(checkQuery, [employee_id]);
+        const user = rows[0];
 
         if (!user || user.password.trim() !== currentPassword.trim()) {
             return res.status(401).json({ success: false, message: "Current password incorrect." });
         }
 
-        await supabase
-            .from('employees')
-            .update({ password: newPassword.trim(), is_first_login: false })
-            .eq('employee_id', employee_id);
+        const updateQuery = `
+            UPDATE employees 
+            SET password = ?, is_first_login = 0 
+            WHERE employee_id = ?
+        `;
+        await db.query(updateQuery, [newPassword.trim(), employee_id]);
 
         return res.status(200).json({ success: true, message: "Password updated!" });
     } catch (err) {
+        console.error('Change Password Error:', err);
         return res.status(500).json({ success: false, message: "Internal error" });
     }
 });

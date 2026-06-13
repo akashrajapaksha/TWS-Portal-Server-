@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const supabase = require('../supabaseClient');
+const db = require('../db'); // ✅ Import your initialized mysql2 pool
 
 /** --- CONSTANTS --- **/
 const ROLE_HIERARCHY = {
@@ -13,22 +13,22 @@ const ROLE_HIERARCHY = {
     'EMPLOYEES': 1
 };
 
-/**
- * NEW CONSTANT: Define safe fields to return to the frontend.
- * This ensures passwords and 2FA secrets never leave the server.
- */
-const SAFE_FIELDS = 'id, employee_id, name, initials, phone_number, email, department, project, designation, status, gender, dob, date_of_joining, address, annual_leave, casual_leave, created_at, role, is_first_login';
+// ✅ Selective safe database field list setup
+const SAFE_FIELDS = 'id, employee_id, name, initials, email, department, project, designation, status, date_of_joining, annual_leave, casual_leave, created_at, role, is_first_login, profile_image, two_factor_secret';
 
 /**
  * HELPER: Clean Incoming Data
  */
 const sanitizeEmployeeData = (data) => {
     const cleaned = { ...data };
-    const dateFields = ['dob', 'date_of_joining'];
+    
+    // 1. Process date fields
+    const dateFields = ['date_of_joining'];
     dateFields.forEach(field => {
         if (cleaned[field] === "" || cleaned[field] === undefined) cleaned[field] = null;
     });
 
+    // 2. Process numerical fields
     const numFields = ['annual_leave', 'casual_leave'];
     numFields.forEach(field => {
         if (cleaned[field] !== undefined) {
@@ -36,6 +36,13 @@ const sanitizeEmployeeData = (data) => {
         }
     });
 
+    // 3. ✅ STRIP DEPRECATED FIELDS: Hard stop against MySQL "Unknown column" field list exceptions
+    delete cleaned.phone_number;
+    delete cleaned.gender;
+    delete cleaned.dob;
+    delete cleaned.address;
+
+    // 4. Strip UI payload operational descriptors
     delete cleaned.admin_id;
     delete cleaned.admin_name;
 
@@ -68,16 +75,14 @@ const authorize = (allowedRoles) => {
 router.get('/public-search/:empId', async (req, res) => {
     try {
         const { empId } = req.params;
-        const { data, error } = await supabase
-            .from('employees')
-            .select('name')
-            .ilike('employee_id', empId.trim()) 
-            .maybeSingle();
+        const [rows] = await db.query(
+            'SELECT name FROM employees WHERE employee_id = ? LIMIT 1', 
+            [empId.trim()]
+        );
 
-        if (error) throw error;
-        if (!data) return res.status(404).json({ success: false, message: "ID not found" });
+        if (rows.length === 0) return res.status(404).json({ success: false, message: "ID not found" });
 
-        res.json({ success: true, name: data.name });
+        res.json({ success: true, name: rows[0].name });
     } catch (err) {
         console.error("Public Search Error:", err.message);
         res.status(500).json({ success: false, message: "Server error" });
@@ -87,24 +92,21 @@ router.get('/public-search/:empId', async (req, res) => {
 /** --- PROTECTED ROUTES --- **/
 
 /**
- * 2. GET: Fetch All Employees (FIXED: Uses SAFE_FIELDS)
+ * 2. GET: Fetch All Employees
  */
 router.get('/', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin', 'TPS']), async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('employees')
-            .select(SAFE_FIELDS) // Removed '*' to hide passwords
-            .order('created_at', { ascending: false });
-
-        if (error) throw error;
-        res.json({ success: true, employees: data });
+        const [rows] = await db.query(
+            `SELECT ${SAFE_FIELDS} FROM employees ORDER BY created_at DESC`
+        );
+        res.json({ success: true, employees: rows });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
 /**
- * 3. POST: Add Employee (FIXED: Selects safe fields for response)
+ * 3. POST: Add Employee
  */
 router.post('/add', authorize(['Super Admin', 'Admin']), async (req, res) => {
     try {
@@ -126,6 +128,8 @@ router.post('/add', authorize(['Super Admin', 'Admin']), async (req, res) => {
                         message: "Access Denied: Admins are only authorized to create standard 'Employees'." 
                     });
                 }
+                // Lock 2FA setups exclusively to root administrators
+                delete employeeData.two_factor_secret;
             } else {
                 return res.status(403).json({ success: false, message: "Access Denied: Role unauthorized for creation." });
             }
@@ -134,28 +138,31 @@ router.post('/add', authorize(['Super Admin', 'Admin']), async (req, res) => {
         employeeData.password = password.trim(); 
         employeeData.is_first_login = true; 
 
-        const { data, error } = await supabase
-            .from('employees')
-            .insert([employeeData])
-            .select(SAFE_FIELDS) // Ensures password isn't in the confirmation response
-            .single();
+        // Native injection query execution via mysql2 pool assignment context
+        const [insertResult] = await db.query('INSERT INTO employees SET ?', [employeeData]);
+        const newInsertedId = insertResult.insertId;
 
-        if (error) {
-            if (error.code === '23505') return res.status(400).json({ success: false, message: "ID or Email already exists." });
-            throw error;
-        }
+        // Return the clean database object matching our safe criteria mapping
+        const [newEmployeeRows] = await db.query(
+            `SELECT ${SAFE_FIELDS} FROM employees WHERE id = ?`, 
+            [newInsertedId]
+        );
 
-        await supabase.from('other_logs').insert({
+        // Record operation timeline entry trace
+        await db.query('INSERT INTO other_logs SET ?', [{
             employee_id: admin_id || "System",
             employee_name: admin_name || "Admin",
             action: "Employee Added",
-            timestamp: new Date().toISOString(),
+            timestamp: new Date().toISOString().slice(0, 19).replace('T', ' '),
             description: `New employee '${employeeData.name}' (${employeeData.role}) added by ${admin_name}.`
-        });
+        }]);
 
-        res.status(201).json({ success: true, message: "Employee added successfully!", employee: data });
+        res.status(201).json({ success: true, message: "Employee added successfully!", employee: newEmployeeRows[0] });
     } catch (err) {
         console.error("Add Employee Error:", err.message);
+        if (err.errno === 1062 || err.code === 'ER_DUP_ENTRY') {
+            return res.status(400).json({ success: false, message: "ID or Email already exists." });
+        }
         res.status(400).json({ success: false, message: err.message });
     }
 });
@@ -171,27 +178,22 @@ router.patch('/change-password', async (req, res) => {
             return res.status(400).json({ success: false, message: "All fields are required." });
         }
 
-        const { data: user, error: fetchError } = await supabase
-            .from('employees')
-            .select('id, password')
-            .eq('employee_id', employee_id)
-            .single();
+        const [users] = await db.query(
+            'SELECT id, password FROM employees WHERE employee_id = ? LIMIT 1', 
+            [employee_id]
+        );
 
-        if (fetchError || !user) return res.status(404).json({ success: false, message: "Employee not found." });
+        if (users.length === 0) return res.status(404).json({ success: false, message: "Employee not found." });
+        const user = users[0];
 
         if (user.password !== currentPassword.trim()) {
             return res.status(401).json({ success: false, message: "Current password incorrect." });
         }
 
-        const { error: updateError } = await supabase
-            .from('employees')
-            .update({ 
-                password: newPassword.trim(),
-                is_first_login: false 
-            })
-            .eq('id', user.id);
-
-        if (updateError) throw updateError;
+        await db.query(
+            'UPDATE employees SET password = ?, is_first_login = ? WHERE id = ?',
+            [newPassword.trim(), false, user.id]
+        );
 
         res.json({ success: true, message: "Password updated successfully." });
     } catch (err) {
@@ -210,16 +212,13 @@ router.put('/:id', authorize(['Super Admin', 'Admin']), async (req, res) => {
 
         const updateData = sanitizeEmployeeData(rawUpdateData);
 
-        const { data: targetUser, error: fetchError } = await supabase
-            .from('employees')
-            .select('role, name')
-            .eq('id', id)
-            .single();
-
-        if (fetchError || !targetUser) return res.status(404).json({ success: false, message: "Target employee not found." });
-
+        const [targets] = await db.query('SELECT role, name FROM employees WHERE id = ? LIMIT 1', [id]);
+        if (targets.length === 0) return res.status(404).json({ success: false, message: "Target employee not found." });
+        
+        const targetUser = targets[0];
         const currentTargetRole = targetUser.role.toUpperCase();
 
+        // Check explicit permission criteria boundaries
         if (editorRole !== 'SUPER ADMIN') {
             if (editorRole === 'ADMIN') {
                 if (currentTargetRole !== 'EMPLOYEES') {
@@ -228,25 +227,23 @@ router.put('/:id', authorize(['Super Admin', 'Admin']), async (req, res) => {
                 if (updateData.role && updateData.role.toUpperCase() !== 'EMPLOYEES') {
                     return res.status(403).json({ success: false, message: "Access Denied: Admins cannot assign management roles." });
                 }
+                // Clear out sensitive properties before execution if not Super Admin
+                delete updateData.two_factor_secret;
             } else {
                 return res.status(403).json({ success: false, message: "Access Denied: Unauthorized." });
             }
         }
 
-        const { error } = await supabase
-            .from('employees')
-            .update(updateData)
-            .eq('id', id);
+        // Apply clean payload query update string execution
+        await db.query('UPDATE employees SET ? WHERE id = ?', [updateData, id]);
 
-        if (error) throw error;
-
-        await supabase.from('other_logs').insert({
+        await db.query('INSERT INTO other_logs SET ?', [{
             employee_id: admin_id || "System",
             employee_name: admin_name || "Admin",
             action: "Employee Updated",
-            timestamp: new Date().toISOString(),
+            timestamp: new Date().toISOString().slice(0, 19).replace('T', ' '),
             description: `Profile of '${targetUser.name}' updated by ${admin_name}.`
-        });
+        }]);
 
         res.json({ success: true, message: "Employee updated successfully" });
     } catch (err) {
@@ -262,16 +259,15 @@ router.delete('/:id', authorize(['Super Admin']), async (req, res) => {
         const { id } = req.params;
         const { admin_id, admin_name, emp_name } = req.query;
 
-        const { error } = await supabase.from('employees').delete().eq('id', id);
-        if (error) throw error;
+        await db.query('DELETE FROM employees WHERE id = ?', [id]);
 
-        await supabase.from('other_logs').insert({
+        await db.query('INSERT INTO other_logs SET ?', [{
             employee_id: admin_id || "System",
             employee_name: admin_name || "Admin",
             action: "Employee Deleted",
-            timestamp: new Date().toISOString(),
+            timestamp: new Date().toISOString().slice(0, 19).replace('T', ' '),
             description: `Employee '${emp_name}' removed by ${admin_name}.`
-        });
+        }]);
 
         res.json({ success: true, message: "Employee deleted successfully" });
     } catch (err) {
@@ -280,21 +276,19 @@ router.delete('/:id', authorize(['Super Admin']), async (req, res) => {
 });
 
 /**
- * 7. GET: Protected Search (FIXED: Only selects name)
+ * 7. GET: Protected Search
  */
 router.get('/search/:empId', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin', 'TPS']), async (req, res) => {
     try {
         const { empId } = req.params;
-        const { data, error } = await supabase
-            .from('employees')
-            .select('name')
-            .ilike('employee_id', empId.trim())
-            .maybeSingle();
+        const [rows] = await db.query(
+            'SELECT name FROM employees WHERE employee_id = ? LIMIT 1', 
+            [empId.trim()]
+        );
 
-        if (error) throw error;
-        if (!data) return res.status(404).json({ success: false, message: "Employee not found." });
+        if (rows.length === 0) return res.status(404).json({ success: false, message: "Employee not found." });
 
-        res.json({ success: true, name: data.name });
+        res.json({ success: true, name: rows[0].name });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }

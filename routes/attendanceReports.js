@@ -1,127 +1,182 @@
 const express = require('express');
-const router = express.Router();
-const db = require('../mysqlClient');
-const supabase = require('../supabaseClient');
+const router = require('express').Router();
+const db = require('../db');
 
+// =========================================================================
+// CONFIGURATION: Set your secondary database name here
+// =========================================================================
+const SECONDARY_DB = 'attendance';
+// =========================================================================
+
+/**
+ * GET /api/attendance-reports
+ * MAIN LIVE VIEW STREAM
+ */
+router.get('/', async (req, res) => {
+    const { auth, employee_id } = req.query;
+
+    // --- HARDCODED SPECIAL EMPLOYEES ---
+    const specialEmployeeIds = ['1001', '1003']; 
+    const isSpecial = specialEmployeeIds.includes(String(employee_id));
+
+    try {
+        let query;
+        let queryParams = [];
+
+        const getShiftSql = (dateCol, empIdCol) => `
+            JSON_UNQUOTE(
+                JSON_EXTRACT(
+                    sa.assignments, 
+                    CONCAT('$.', CAST(${empIdCol} AS CHAR), '.', CAST(DAY(${dateCol}) AS CHAR))
+                )
+            )
+        `;
+
+        if (auth === 'SUPER ADMIN') {
+            query = `
+                SELECT 
+                    id, employee_id, employee_name, date, 
+                    check_in_time, check_out_time, shift_name,
+                    CASE 
+                        WHEN employee_id IN (${specialEmployeeIds.map(id => `'${id}'`).join(',')}) THEN 'N/A'
+                        ELSE status
+                    END as status
+                FROM (
+                    SELECT 
+                        ci.id, ci.employee_id, ci.employee_name,
+                        DATE_FORMAT(ci.timestamp, '%d %M %Y') as date,
+                        TIME_FORMAT(ci.timestamp, '%h:%i %p') as check_in_time,
+                        '--:--' as check_out_time,
+                        COALESCE(${getShiftSql('ci.timestamp', 'ci.employee_id')}, 'N/A') as shift_name,
+                        'CHECK-IN' as status,
+                        ci.timestamp as raw_time
+                    FROM ${SECONDARY_DB}.attendance_logs_check_in ci
+                    LEFT JOIN ${SECONDARY_DB}.shift_assignments sa ON sa.month_year = DATE_FORMAT(ci.timestamp, '%Y-%m')
+                    
+                    UNION ALL
+                    
+                    SELECT 
+                        co.id, co.employee_id, co.employee_name,
+                        DATE_FORMAT(co.timestamp, '%d %M %Y') as date,
+                        '--:--' as check_in_time,
+                        TIME_FORMAT(co.timestamp, '%h:%i %p') as out_time,
+                        COALESCE(${getShiftSql('co.timestamp', 'co.employee_id')}, 'N/A') as shift_name,
+                        'CHECK-OUT' as status,
+                        co.timestamp as raw_time
+                    FROM ${SECONDARY_DB}.attendance_logs_check_out co
+                    LEFT JOIN ${SECONDARY_DB}.shift_assignments sa ON sa.month_year = DATE_FORMAT(co.timestamp, '%Y-%m')
+                ) combined_logs
+                GROUP BY employee_id, raw_time, status 
+                ORDER BY raw_time DESC
+                LIMIT 50
+            `;
+        } else {
+            if (!employee_id) return res.status(400).json({ success: false, message: "ID required" });
+
+            query = `
+                SELECT 
+                    d.date,
+                    TIME_FORMAT(ci.timestamp, '%h:%i %p') as check_in_time,
+                    TIME_FORMAT(co.timestamp, '%h:%i %p') as check_out_time,
+                    d.shift_code as shift_name,
+                    CASE 
+                        WHEN ? IN (${specialEmployeeIds.map(id => `'${id}'`).join(',')}) THEN 'N/A'
+                        WHEN ci.timestamp IS NOT NULL AND co.timestamp IS NOT NULL THEN 'Completed'
+                        WHEN ci.timestamp IS NOT NULL THEN 'Check-in Only'
+                        WHEN co.timestamp IS NOT NULL THEN 'Check-out Only'
+                        WHEN d.shift_code = 'RD' THEN 'Off Day'
+                        ELSE 'Absent'
+                    END as status
+                FROM (
+                    SELECT 
+                        days.curr_date as date,
+                        ${getShiftSql('days.curr_date', '?')} as shift_code
+                    FROM (
+                        SELECT CURDATE() - INTERVAL (a.a + (10 * b.b)) DAY as curr_date
+                        FROM (SELECT 0 as a UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) AS a
+                        CROSS JOIN (SELECT 0 as b UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3) AS b
+                    ) days
+                    LEFT JOIN ${SECONDARY_DB}.shift_assignments sa ON sa.month_year = DATE_FORMAT(days.curr_date, '%Y-%m')
+                    WHERE days.curr_date <= CURDATE()
+                ) d
+                LEFT JOIN ${SECONDARY_DB}.attendance_logs_check_in ci ON ci.employee_id = ? 
+                    AND DATE(ci.timestamp) = d.date
+                LEFT JOIN ${SECONDARY_DB}.attendance_logs_check_out co ON co.employee_id = ? 
+                    AND (
+                        (d.shift_code = 'C' AND DATE(co.timestamp) = DATE_ADD(d.date, INTERVAL 1 DAY)) OR
+                        (d.shift_code IN ('A', 'B', 'Night') AND DATE(co.timestamp) = d.date)
+                    )
+                WHERE d.shift_code IS NOT NULL
+                ORDER BY d.date DESC 
+                LIMIT 31
+            `;
+            queryParams = [employee_id, employee_id, employee_id, employee_id];
+        }
+
+        const [rows] = await db.query(query, queryParams);
+        res.json({ success: true, data: rows });
+
+    } catch (err) {
+        console.error("Database Error:", err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+
+/**
+ * GET /api/attendance-reports/generate
+ * GENERATION ENUMERATION HANDLER
+ */
 router.get('/generate', async (req, res) => {
-    const { employee_id, start_date, end_date } = req.query;
+    // Standardizing param parsing fallback checks
+    const employee_id = req.query.employee_id || req.query.empId;
+    const { start_date, end_date } = req.query;
 
-    if (!employee_id || !start_date || !end_date) {
-        return res.status(400).json({ success: false, message: "Missing required parameters" });
+    if (!start_date || !end_date) {
+        return res.status(400).json({ success: false, message: "Start date and end date are required." });
     }
 
     try {
-        // --- 1. GET EARLIEST PUNCH PER DAY ---
-        // We use MIN(timestamp) and GROUP BY DATE(timestamp) to merge duplicate scans 
-        // occurring on the same day into a single record.
-        const checkInQuery = `
-            SELECT 
-                DATE(ci.timestamp) as punch_date,
-                MIN(ci.timestamp) as first_punch,
-                JSON_UNQUOTE(
-                    JSON_EXTRACT(
-                        sa.assignments, 
-                        CONCAT('$.', CAST(ci.employee_id AS CHAR), '.', CAST(DAY(ci.timestamp) AS CHAR))
-                    )
-                ) as shift_code
-            FROM attendance_logs_check_in ci
-            LEFT JOIN shift_assignments sa ON sa.month_year = DATE_FORMAT(ci.timestamp, '%Y-%m')
-            WHERE ci.employee_id = ? 
-            AND DATE(ci.timestamp) BETWEEN ? AND ?
-            GROUP BY punch_date, shift_code
-        `;
+        let sql;
+        let params = [];
 
-        // --- 2. GET OVERTIME (OT) ---
-        // Calculates hours worked beyond the 9-hour standard shift.
-        const otQuery = `
-            SELECT 
-                SUM(GREATEST(0, TIMESTAMPDIFF(HOUR, ci.timestamp, co.timestamp) - 9)) as totalOT
-            FROM attendance_logs_check_in ci
-            JOIN attendance_logs_check_out co ON ci.employee_id = co.employee_id 
-                AND DATE(ci.timestamp) = DATE(co.timestamp)
-            WHERE ci.employee_id = ? 
-            AND DATE(ci.timestamp) BETWEEN ? AND ?
-        `;
+        if (employee_id) {
+            sql = `
+                SELECT id, employee_id, employee_name, timestamp, 'CHECK-IN' as entry_type 
+                FROM ${SECONDARY_DB}.attendance_logs_check_in
+                WHERE employee_id = ? AND DATE(timestamp) BETWEEN ? AND ?
+                UNION ALL
+                SELECT id, employee_id, employee_name, timestamp, 'CHECK-OUT' as entry_type
+                FROM ${SECONDARY_DB}.attendance_logs_check_out
+                WHERE employee_id = ? AND DATE(timestamp) BETWEEN ? AND ?
+                ORDER BY timestamp DESC
+            `;
+            params = [employee_id, start_date, end_date, employee_id, start_date, end_date];
+        } else {
+            sql = `
+                SELECT id, employee_id, employee_name, timestamp, 'CHECK-IN' as entry_type 
+                FROM ${SECONDARY_DB}.attendance_logs_check_in
+                WHERE DATE(timestamp) BETWEEN ? AND ?
+                UNION ALL
+                SELECT id, employee_id, employee_name, timestamp, 'CHECK-OUT' as entry_type
+                FROM ${SECONDARY_DB}.attendance_logs_check_out
+                WHERE DATE(timestamp) BETWEEN ? AND ?
+                ORDER BY timestamp DESC
+            `;
+            params = [start_date, end_date, start_date, end_date];
+        }
 
-        const [checkInRows] = await db.query(checkInQuery, [employee_id, start_date, end_date]);
-        const [otRows] = await db.query(otQuery, [employee_id, start_date, end_date]);
+        const [rows] = await db.query(sql, params);
 
-        // --- 3. CALCULATE LATES (STRICT 05:31 AM CUTOFF) ---
-        let totalLates = 0;
-        
-        /**
-         * To be 100% safe from duplicates, we use a Map.
-         * Key: Date String (e.g., "2026-05-06")
-         * Value: The earliest punch record for that day.
-         */
-        const dailyFirstPunches = new Map();
-
-        checkInRows.forEach(row => {
-            const dateKey = new Date(row.first_punch).toISOString().split('T')[0];
-            
-            // If we haven't recorded a punch for this date yet, add it.
-            if (!dailyFirstPunches.has(dateKey)) {
-                dailyFirstPunches.set(dateKey, row);
-            }
-        });
-
-        // Now evaluate the unique daily punches against shift thresholds
-        dailyFirstPunches.forEach((record) => {
-            const punchTime = new Date(record.first_punch);
-            const checkInMinutes = (punchTime.getHours() * 60) + punchTime.getMinutes();
-            
-            // Default to 'A' (Morning) if no shift code is found
-            const shift = record.shift_code ? String(record.shift_code).trim().toUpperCase() : 'A';
-
-            /**
-             * THRESHOLDS (Total Minutes from Midnight)
-             * A / MORNING:   05:31 AM = 331 mins (Late if > 331)
-             * B / AFTERNOON: 01:31 PM = 811 mins (Late if > 811)
-             * C / NIGHT:     09:31 PM = 1291 mins (Late if > 1291)
-             */
-            if ((shift === 'A' || shift === 'MORNING') && checkInMinutes > 331) {
-                totalLates++;
-            } 
-            else if ((shift === 'B' || shift === 'AFTERNOON') && checkInMinutes > 811) {
-                totalLates++;
-            } 
-            else if ((shift === 'C' || shift === 'NIGHT') && checkInMinutes > 1291) {
-                totalLates++;
-            }
-        });
-
-        // --- 4. GET APPROVED LEAVES (SUPABASE) ---
-        const [res1, res2] = await Promise.all([
-            supabase.from('leave_applications')
-                .select('number_of_days')
-                .eq('employee_id', employee_id)
-                .eq('status', 'Approved')
-                .gte('start_date', start_date)
-                .lte('end_date', end_date),
-            supabase.from('leave_applications_two')
-                .select('number_of_days')
-                .eq('employee_id', employee_id)
-                .eq('status', 'Approved')
-                .gte('start_date', start_date)
-                .lte('end_date', end_date)
-        ]);
-
-        const totalLeaves = [...(res1.data || []), ...(res2.data || [])]
-            .reduce((sum, item) => sum + item.number_of_days, 0);
-
-        // --- 5. FINAL RESPONSE ---
-        res.json({
-            success: true,
-            data: {
-                totalOT: otRows[0]?.totalOT || 0,
-                totalLates: totalLates,
-                totalLeaves: totalLeaves || 0
-            }
+        // Crucial Change: Return empty array structural success instead of crashing with hard failures
+        return res.json({ 
+            success: true, 
+            data: rows || [] 
         });
 
     } catch (err) {
-        console.error("Report Generation Error:", err);
-        res.status(500).json({ success: false, message: "Server Error" });
+        console.error("Report Generation Database Error:", err);
+        res.status(500).json({ success: false, message: err.message });
     }
 });
 

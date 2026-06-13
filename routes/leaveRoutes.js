@@ -1,7 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../mysqlClient'); // MySQL Client Pool
-const supabase = require('../supabaseClient'); // Supabase Client
+const db = require('../db'); // Your working MySQL Client Pool configuration
 
 /**
  * 🔐 AUTH MIDDLEWARE: User Role Verification
@@ -22,35 +21,41 @@ const authorize = (allowedRoles) => {
 };
 
 /**
- * 🧮 HELPER: Calculate Annual and Casual Balances (Supabase Only)
+ * 🧮 HELPER: Calculate Annual and Casual Balances (Converted to MySQL)
  */
 const calculateRemainingBalance = async (employee_id) => {
-    const { data: emp } = await supabase
-        .from('employees')
-        .select('annual_leave, casual_leave')
-        .eq('id', employee_id)
-        .single();
+    // 1. Fetch limits directly from your checked employees schema layout
+    const [empRows] = await db.execute(
+        "SELECT annual_leave, casual_leave FROM employees WHERE employee_id = ? LIMIT 1",
+        [employee_id]
+    );
+    
+    if (empRows.length === 0) {
+        return { annual_balance: 0, casual_balance: 0 };
+    }
+    const emp = empRows[0];
 
-    const { data: approvedLeaves } = await supabase
-        .from('leave_applications')
-        .select('leave_type, number_of_days')
-        .eq('employee_id', employee_id)
-        .eq('status', 'Approved');
+    // 2. Aggregate counts utilizing efficient native SQL processing
+    const [leaveRows] = await db.execute(
+        `SELECT leave_type, SUM(number_of_days) as total_days 
+         FROM leave_applications 
+         WHERE employee_id = ? AND status = 'Approved' 
+         GROUP BY leave_type`,
+        [employee_id]
+    );
 
     let takenAnnual = 0;
     let takenCasual = 0;
 
-    if (approvedLeaves) {
-        approvedLeaves.forEach(leave => {
-            const type = leave.leave_type.toLowerCase();
-            if (type === 'annual') takenAnnual += leave.number_of_days;
-            if (type === 'casual') takenCasual += leave.number_of_days;
-        });
-    }
+    leaveRows.forEach(row => {
+        const type = row.leave_type.toLowerCase();
+        if (type === 'annual') takenAnnual = parseFloat(row.total_days) || 0;
+        if (type === 'casual') takenCasual = parseFloat(row.total_days) || 0;
+    });
 
     return {
-        annual_balance: (emp?.annual_leave || 0) - takenAnnual,
-        casual_balance: (emp?.casual_leave || 0) - takenCasual
+        annual_balance: (emp.annual_leave || 0) - takenAnnual,
+        casual_balance: (emp.casual_leave || 0) - takenCasual
     };
 };
 
@@ -61,16 +66,19 @@ router.post('/apply', async (req, res) => {
     try {
         const { employee_id, employee_name, leave_type, start_date, end_date, number_of_days, reason, user_id } = req.body;
         const normalizedType = leave_type.toLowerCase();
-        let targetTable = (normalizedType === 'annual' || normalizedType === 'casual') 
-                          ? 'leave_applications' 
-                          : 'leave_applications_two';
-
-        // 1. MySQL Insert
-        const mysqlQuery = `INSERT INTO ${targetTable} 
-            (employee_id, employee_name, leave_type, start_date, end_date, number_of_days, reason, user_id, status) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending')`;
         
-        await db.execute(mysqlQuery, [
+        // Pick destination table targets exactly like your frontend components expect
+        let targetTable = (normalizedType === 'annual' || normalizedType === 'casual') 
+                        ? 'leave_applications' 
+                        : 'leave_applications_two';
+
+        const mysqlQuery = `
+            INSERT INTO ${targetTable} 
+            (employee_id, employee_name, leave_type, start_date, end_date, number_of_days, reason, user_id, status) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending')
+        `;
+        
+        const [result] = await db.execute(mysqlQuery, [
             employee_id || null, 
             employee_name || null, 
             leave_type || null, 
@@ -81,18 +89,22 @@ router.post('/apply', async (req, res) => {
             user_id || null
         ]);
 
-        // 2. Supabase Insert
-        const { data, error } = await supabase
-            .from(targetTable)
-            .insert([{
-                employee_id, employee_name, leave_type, start_date, 
-                end_date, number_of_days, reason, user_id, status: 'Pending'
-            }])
-            .select();
+        // Construct mock response tracking block to map seamlessly with your client variables
+        const fakeDataOutput = [{
+            id: result.insertId,
+            employee_id,
+            employee_name,
+            leave_type,
+            start_date,
+            end_date,
+            number_of_days,
+            reason,
+            user_id,
+            status: 'Pending',
+            apply_date: new Date()
+        }];
 
-        if (error) throw error;
-
-        res.status(201).json({ success: true, message: "Application submitted successfully!", leave: data });
+        res.status(201).json({ success: true, message: "Application submitted successfully!", leave: fakeDataOutput });
 
     } catch (err) {
         console.error("MySQL Insert Error:", err);
@@ -120,32 +132,24 @@ router.patch('/approve/:id', authorize(['Super Admin', 'ER']), async (req, res) 
                             ? 'leave_applications_two' 
                             : 'leave_applications';
 
-        // Fix to prevent undefined parameters
         const mysqlStatus = status || null;
-        const mysqlEmpId = employee_id || null;
-        const mysqlStartDate = start_date || null;
 
-        // 1. MySQL Update
+        // 1. Update targeting specific unique application instance records
         await db.execute(
-            `UPDATE ${targetTable} SET status = ? WHERE employee_id = ? AND start_date = ?`, 
-            [mysqlStatus, mysqlEmpId, mysqlStartDate]
+            `UPDATE ${targetTable} SET status = ? WHERE id = ?`, 
+            [mysqlStatus, id]
         );
 
-        // 2. Supabase Update (Using primary ID)
-        const { error: updateErr } = await supabase
-            .from(targetTable)
-            .update({ status: mysqlStatus })
-            .eq('id', id);
-
-        if (updateErr) throw updateErr;
-
-        // 3. Logs (Supabase ONLY)
-        await supabase.from('other_logs').insert({
-            employee_id: admin_id || null,
-            employee_name: admin_name || null,
-            action: `Leave ${mysqlStatus}`,
-            description: `${leave_type} leave has been ${mysqlStatus}. (ID: ${id})`
-        });
+        // 2. Track activity inside log history table
+        await db.execute(
+            "INSERT INTO other_logs (employee_id, employee_name, action, description) VALUES (?, ?, ?, ?)",
+            [
+                admin_id || null,
+                admin_name || null,
+                `Leave ${mysqlStatus}`,
+                `${leave_type} leave has been ${mysqlStatus}. (ID: ${id})`
+            ]
+        );
 
         res.json({ success: true, message: `Leave status updated to ${mysqlStatus}.` });
     } catch (err) {
@@ -155,22 +159,27 @@ router.patch('/approve/:id', authorize(['Super Admin', 'ER']), async (req, res) 
 });
 
 /**
- * 📄 3. GET: All leaves for a specific employee (Supabase Only)
+ * 📄 3. GET: All leaves for a specific employee
  */
 router.get('/my-leaves/:empId', async (req, res) => {
     try {
         const { empId } = req.params;
+
+        // Parallel execution patterns parsing records out of both primary tables
         const [res1, res2] = await Promise.all([
-            supabase.from('leave_applications').select('*').eq('employee_id', empId),
-            supabase.from('leave_applications_two').select('*').eq('employee_id', empId)
+            db.execute("SELECT * FROM leave_applications WHERE employee_id = ?", [empId]),
+            db.execute("SELECT * FROM leave_applications_two WHERE employee_id = ?", [empId])
         ]);
 
-        if (res1.error) throw res1.error;
-        if (res2.error) throw res2.error;
+        // Gather underlying structural data arrays from pool output envelopes
+        const data1 = res1[0] || [];
+        const data2 = res2[0] || [];
 
-        const combined = [...res1.data, ...res2.data].sort((a, b) => 
-            new Date(b.apply_date) - new Date(a.apply_date)
-        );
+        const combined = [...data1, ...data2].sort((a, b) => {
+            const dateA = a.apply_date || a.created_at;
+            const dateB = b.apply_date || b.created_at;
+            return new Date(dateB) - new Date(dateA);
+        });
 
         res.json({ success: true, leaves: combined });
     } catch (err) {
@@ -179,18 +188,23 @@ router.get('/my-leaves/:empId', async (req, res) => {
 });
 
 /**
- * 👑 4. GET: All leave applications (Admin/ER Only - Supabase Only)
+ * 👑 4. GET: All leave applications (Admin/ER Only)
  */
 router.get('/all', authorize(['Super Admin', 'ER']), async (req, res) => {
     try {
         const [res1, res2] = await Promise.all([
-            supabase.from('leave_applications').select('*'),
-            supabase.from('leave_applications_two').select('*')
+            db.execute("SELECT * FROM leave_applications"),
+            db.execute("SELECT * FROM leave_applications_two")
         ]);
 
-        const allLeaves = [...(res1.data || []), ...(res2.data || [])].sort((a, b) => 
-            new Date(b.apply_date) - new Date(a.apply_date)
-        );
+        const data1 = res1[0] || [];
+        const data2 = res2[0] || [];
+
+        const allLeaves = [...data1, ...data2].sort((a, b) => {
+            const dateA = a.apply_date || a.created_at;
+            const dateB = b.apply_date || b.created_at;
+            return new Date(dateB) - new Date(dateA);
+        });
 
         res.json({ success: true, leaves: allLeaves });
     } catch (err) {
@@ -199,13 +213,18 @@ router.get('/all', authorize(['Super Admin', 'ER']), async (req, res) => {
 });
 
 /**
- * 💰 5. GET: Get Leave Balance (Supabase Only)
+ * 💰 5. GET: Get Leave Balance
  */
 router.get('/balance/:empId', async (req, res) => {
     try {
         const { empId } = req.params;
         const balances = await calculateRemainingBalance(empId);
-        res.json({ success: true, annual: balances.annual_balance, casual: balances.casual_balance });
+        
+        res.json({ 
+            success: true, 
+            annual: balances.annual_balance, 
+            casual: balances.casual_balance 
+        });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }

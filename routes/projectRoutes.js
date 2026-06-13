@@ -1,13 +1,9 @@
 const express = require('express');
 const router = express.Router();
-const supabase = require('../supabaseClient');
+const db = require('../db'); // ✅ Pointing to your local MySQL Client
 
 /**
  * AUTH MIDDLEWARE
- * Enforces permissions:
- * - View: Super Admin, Supervisors, ER, Admin, TSP, Employees
- * - Create/Update: Super Admin, Supervisors, ER, Admin
- * - Delete: Super Admin, Supervisors, ER
  */
 const authorize = (allowedRoles) => {
     return (req, res, next) => {
@@ -23,21 +19,16 @@ const authorize = (allowedRoles) => {
 };
 
 // 1. GET: Fetch all projects
-// PERMISSION: All internal roles (Employees need this to see bonus rules)
+// PERMISSION: All internal roles
 router.get('/', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin', 'TSP', 'Employees']), async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('projects')
-            .select('*')
-            .order('id', { ascending: false });
+        const queryStr = 'SELECT * FROM projects ORDER BY created_date DESC';
+        const [rows] = await db.query(queryStr);
 
-        if (error) throw error;
-
-        /**
-         * Returning raw data array directly. 
-         * This ensures BonusCalculation.tsx can use data.map() immediately.
-         */
-        res.json(data || []);
+        res.json({
+            success: true,
+            data: rows || []
+        });
     } catch (err) {
         console.error("❌ Fetch Error:", err.message);
         res.status(500).json({ success: false, message: "Could not fetch projects." });
@@ -45,76 +36,86 @@ router.get('/', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin', 'TSP', '
 });
 
 // 2. POST: Create a new project
-// PERMISSION: Super Admin, Supervisors, ER, Admin
 router.post('/add', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin']), async (req, res) => {
     try {
         const { name, client, status, deadline, employee_id, employee_name } = req.body;
-        
-        // Sanitize date to prevent Postgres syntax errors
         const cleanDeadline = deadline === "" ? null : deadline;
+        
+        // MySQL handles arrays/objects inside JSON type columns as stringified content formats
+        const defaultBonusTiers = JSON.stringify([]);
 
-        const { data, error } = await supabase
-            .from('projects')
-            .insert([{ 
-                name, 
-                client, 
-                status, 
-                deadline: cleanDeadline,
-                bonus_tiers: [] // Initialize with empty array for JSONB
-            }])
-            .select();
+        const insertQuery = `
+            INSERT INTO projects (name, client, status, deadline, bonus_tiers) 
+            VALUES (?, ?, ?, ?, ?)
+        `;
+        const [insertResult] = await db.query(insertQuery, [
+            name, 
+            client, 
+            status || 'Active', 
+            cleanDeadline, 
+            defaultBonusTiers
+        ]);
 
-        if (error) throw error;
+        // Fetch back the newly inserted row entry record
+        const [newProjectRows] = await db.query('SELECT * FROM projects WHERE id = ?', [insertResult.insertId]);
 
-        // --- Audit Log ---
-        await supabase.from('other_logs').insert([{
-            employee_id: employee_id || "System",
-            employee_name: employee_name || "Admin",
-            action: "Project Created",
-            timestamp: new Date().toISOString(),
-            description: `A new project '${name}' was created for client '${client}'.`
-        }]);
+        // Log the event trail tracking info updates
+        const logQuery = `
+            INSERT INTO other_logs (employee_id, employee_name, action, timestamp, description) 
+            VALUES (?, ?, ?, NOW(), ?)
+        `;
+        await db.query(logQuery, [
+            employee_id || "System",
+            employee_name || "Admin",
+            "Project Created",
+            `A new project '${name}' was created for client '${client}'.`
+        ]);
 
-        res.status(201).json({ success: true, project: data[0] });
+        res.status(201).json({ success: true, project: newProjectRows[0] });
     } catch (err) {
         console.error("❌ Add Error:", err.message);
         res.status(400).json({ success: false, message: err.message });
     }
 });
 
-// 3. PUT: Update an existing project (Includes Bonus Tiers)
-// PERMISSION: Super Admin, Supervisors, ER, Admin
+// 3. PUT: Update an existing project
 router.put('/:id', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin']), async (req, res) => {
     try {
         const { id } = req.params;
         const { name, client, status, deadline, bonus_tiers, employee_id, employee_name } = req.body;
-        
         const cleanDeadline = deadline === "" ? null : deadline;
+        
+        const stringifiedBonusTiers = bonus_tiers ? JSON.stringify(bonus_tiers) : JSON.stringify([]);
 
-        const { data, error } = await supabase
-            .from('projects')
-            .update({ 
-                name, 
-                client, 
-                status, 
-                deadline: cleanDeadline,
-                bonus_tiers: bonus_tiers || [] // Support for dynamic bonus configuration
-            })
-            .eq('id', id)
-            .select();
+        const updateQuery = `
+            UPDATE projects 
+            SET name = ?, client = ?, status = ?, deadline = ?, bonus_tiers = ? 
+            WHERE id = ?
+        `;
+        await db.query(updateQuery, [
+            name, 
+            client, 
+            status, 
+            cleanDeadline, 
+            stringifiedBonusTiers, 
+            id
+        ]);
 
-        if (error) throw error;
+        // Fetch back modified record structure mapping data representation context
+        const [updatedProjectRows] = await db.query('SELECT * FROM projects WHERE id = ?', [id]);
 
-        // --- Audit Log ---
-        await supabase.from('other_logs').insert([{
-            employee_id: employee_id || "System",
-            employee_name: employee_name || "Admin",
-            action: "Project Updated",
-            timestamp: new Date().toISOString(),
-            description: `Project '${name}' was updated. Bonus tiers or settings modified.`
-        }]);
+        const logQuery = `
+            INSERT INTO other_logs (employee_id, employee_name, action, timestamp, description) 
+            VALUES (?, ?, ?, NOW(), ?)
+        `;
+        await db.query(logQuery, [
+            employee_id || "System",
+            employee_name || "Admin",
+            "Project Updated",
+            `Project '${name}' was updated.`
+        ]);
 
-        res.json({ success: true, project: data[0] });
+        res.json({ success: true, project: updatedProjectRows[0] });
     } catch (err) {
         console.error("❌ Update Error:", err.message);
         res.status(400).json({ success: false, message: err.message });
@@ -122,27 +123,24 @@ router.put('/:id', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin']), asy
 });
 
 // 4. DELETE: Permanently remove a project
-// PERMISSION: Super Admin, Supervisors, ER
 router.delete('/:id', authorize(['Super Admin', 'Supervisors', 'ER']), async (req, res) => {
     try {
         const { id } = req.params;
         const { employee_id, employee_name, project_name } = req.query;
 
-        const { error } = await supabase
-            .from('projects')
-            .delete()
-            .eq('id', id);
+        const deleteQuery = 'DELETE FROM projects WHERE id = ?';
+        await db.query(deleteQuery, [id]);
             
-        if (error) throw error;
-
-        // --- Audit Log ---
-        await supabase.from('other_logs').insert([{
-            employee_id: employee_id || "System",
-            employee_name: employee_name || "Admin",
-            action: "Project Deleted",
-            timestamp: new Date().toISOString(),
-            description: `Project '${project_name || id}' was permanently removed from the system.`
-        }]);
+        const logQuery = `
+            INSERT INTO other_logs (employee_id, employee_name, action, timestamp, description) 
+            VALUES (?, ?, ?, NOW(), ?)
+        `;
+        await db.query(logQuery, [
+            employee_id || "System",
+            employee_name || "Admin",
+            "Project Deleted",
+            `Project '${project_name || id}' was permanently removed.`
+        ]);
 
         res.json({ success: true, message: "Project deleted successfully" });
     } catch (err) {

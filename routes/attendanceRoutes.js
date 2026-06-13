@@ -1,12 +1,17 @@
 const express = require('express');
 const router = require('express').Router();
-const db = require('../mysqlClient');
+const db = require('../db');
+
+// =========================================================================
+// CONFIGURATION: Set your secondary database name here
+// =========================================================================
+const SECONDARY_DB = 'attendance'; // Matches your logs config
+// =========================================================================
 
 router.get('/', async (req, res) => {
     const { auth, employee_id } = req.query;
 
     // --- HARDCODED SPECIAL EMPLOYEES ---
-    // Add the specific IDs here that should not follow shift rules
     const specialEmployeeIds = ['1001', '1003']; 
     const isSpecial = specialEmployeeIds.includes(String(employee_id));
 
@@ -26,7 +31,6 @@ router.get('/', async (req, res) => {
         if (auth === 'SUPER ADMIN') {
             /**
              * SUPER ADMIN VIEW: Raw Activity Stream
-             * Filters duplicates and labels special employees as N/A status.
              */
             query = `
                 SELECT 
@@ -46,8 +50,8 @@ router.get('/', async (req, res) => {
                         COALESCE(${getShiftSql('ci.timestamp', 'ci.employee_id')}, 'N/A') as shift_name,
                         'CHECK-IN' as status,
                         ci.timestamp as raw_time
-                    FROM attendance_logs_check_in ci
-                    LEFT JOIN shift_assignments sa ON sa.month_year = DATE_FORMAT(ci.timestamp, '%Y-%m')
+                    FROM ${SECONDARY_DB}.attendance_logs_check_in ci
+                    LEFT JOIN ${SECONDARY_DB}.shift_assignments sa ON sa.month_year = DATE_FORMAT(ci.timestamp, '%Y-%m')
                     
                     UNION ALL
                     
@@ -59,8 +63,8 @@ router.get('/', async (req, res) => {
                         COALESCE(${getShiftSql('co.timestamp', 'co.employee_id')}, 'N/A') as shift_name,
                         'CHECK-OUT' as status,
                         co.timestamp as raw_time
-                    FROM attendance_logs_check_out co
-                    LEFT JOIN shift_assignments sa ON sa.month_year = DATE_FORMAT(co.timestamp, '%Y-%m')
+                    FROM ${SECONDARY_DB}.attendance_logs_check_out co
+                    LEFT JOIN ${SECONDARY_DB}.shift_assignments sa ON sa.month_year = DATE_FORMAT(co.timestamp, '%Y-%m')
                 ) combined_logs
                 GROUP BY employee_id, raw_time, status 
                 ORDER BY raw_time DESC
@@ -70,8 +74,7 @@ router.get('/', async (req, res) => {
             if (!employee_id) return res.status(400).json({ success: false, message: "ID required" });
 
             /**
-             * EMPLOYEE VIEW: 
-             * If the ID is in the special list, we return 'N/A' for status.
+             * EMPLOYEE VIEW
              */
             query = `
                 SELECT 
@@ -97,12 +100,12 @@ router.get('/', async (req, res) => {
                         FROM (SELECT 0 as a UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) AS a
                         CROSS JOIN (SELECT 0 as b UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3) AS b
                     ) days
-                    LEFT JOIN shift_assignments sa ON sa.month_year = DATE_FORMAT(days.curr_date, '%Y-%m')
+                    LEFT JOIN ${SECONDARY_DB}.shift_assignments sa ON sa.month_year = DATE_FORMAT(days.curr_date, '%Y-%m')
                     WHERE days.curr_date <= CURDATE()
                 ) d
-                LEFT JOIN attendance_logs_check_in ci ON ci.employee_id = ? 
+                LEFT JOIN ${SECONDARY_DB}.attendance_logs_check_in ci ON ci.employee_id = ? 
                     AND DATE(ci.timestamp) = d.date
-                LEFT JOIN attendance_logs_check_out co ON co.employee_id = ? 
+                LEFT JOIN ${SECONDARY_DB}.attendance_logs_check_out co ON co.employee_id = ? 
                     AND (
                         (d.shift_code = 'C' AND DATE(co.timestamp) = DATE_ADD(d.date, INTERVAL 1 DAY)) OR
                         (d.shift_code IN ('A', 'B', 'Night') AND DATE(co.timestamp) = d.date)
@@ -122,7 +125,5 @@ router.get('/', async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
-
-
 
 module.exports = router;

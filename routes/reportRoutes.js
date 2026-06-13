@@ -1,12 +1,9 @@
 const express = require('express');
 const router = express.Router();
-const supabase = require('../supabaseClient');
+const mysqlPool = require('../db'); // Using your local MySQL client pool
 
 /**
  * GET: Performance Report Data
- * Logic: 
- * - Employees: Can only see their own data based on logged-in ID.
- * - Others: Can search for any employee using 'searchId'.
  */
 router.get('/performance', async (req, res) => {
     try {
@@ -14,46 +11,58 @@ router.get('/performance', async (req, res) => {
 
         // Determine the target ID based on the permission matrix
         let targetEmployeeId;
-
         if (userRole === 'Employees') {
-            // Requirement: "only relevant user data show"
             targetEmployeeId = loggedInEmployeeId;
         } else {
-            // Requirement: "can search any employee"
-            // If searchId is provided by admin/supervisor, use it. 
-            // Otherwise, it can stay undefined to fetch global data (if needed)
             targetEmployeeId = searchId || null;
         }
 
-        // 1. Build Queries
-        let orderQuery = supabase.from('orders').select('*');
-        let mistakeQuery = supabase.from('mistakes').select('*');
+        // --- 1. BUILD SQL QUERIES DYNAMICALLY ---
+        let orderQuery = `SELECT * FROM orders WHERE 1=1`;
+        let mistakeQuery = `SELECT * FROM mistakes WHERE 1=1`;
+        const orderParams = [];
+        const mistakeParams = [];
 
         // Apply Targeted ID Filter
         if (targetEmployeeId) {
-            orderQuery = orderQuery.eq('employee_id', targetEmployeeId);
-            mistakeQuery = mistakeQuery.eq('employeeid', targetEmployeeId);
+            orderQuery += ` AND employee_id = ?`;
+            orderParams.push(targetEmployeeId);
+
+            mistakeQuery += ` AND employeeid = ?`;
+            mistakeParams.push(targetEmployeeId);
         }
 
         // Apply Date Range Filters
         if (fromDate) {
-            orderQuery = orderQuery.gte('date', fromDate);
-            mistakeQuery = mistakeQuery.gte('date', fromDate);
+            orderQuery += ` AND date >= ?`;
+            orderParams.push(fromDate);
+
+            mistakeQuery += ` AND date >= ?`;
+            mistakeParams.push(fromDate);
         }
         if (toDate) {
-            orderQuery = orderQuery.lte('date', toDate);
-            mistakeQuery = mistakeQuery.lte('date', toDate);
+            orderQuery += ` AND date <= ?`;
+            orderParams.push(toDate);
+
+            mistakeQuery += ` AND date <= ?`;
+            mistakeParams.push(toDate);
         }
 
-        const [ordersRes, mistakesRes] = await Promise.all([orderQuery, mistakeQuery]);
+        // Sort records sequentially by date
+        orderQuery += ` ORDER BY date ASC`;
+        mistakeQuery += ` ORDER BY date ASC`;
 
-        if (ordersRes.error) throw ordersRes.error;
-        if (mistakesRes.error) throw mistakesRes.error;
+        // Execute queries concurrently using promise wrappers
+        const [ordersResult, mistakesResult] = await Promise.all([
+            mysqlPool.query(orderQuery, orderParams),
+            mysqlPool.query(mistakeQuery, mistakeParams)
+        ]);
 
-        const orderData = ordersRes.data || [];
-        const rawMistakeData = mistakesRes.data || [];
+        // mysql2 returns an array where index [0] contains the row packets
+        const orderData = ordersResult[0] || [];
+        const rawMistakeData = mistakesResult[0] || [];
 
-        // 2. Data Categorization (Financial vs General)
+        // --- 2. DATA CATEGORIZATION (Financial vs General) ---
         const financialMistakes = rawMistakeData.filter(m => 
             m.mistake_type === 'MONEY SHORT' || m.mistake_type === 'DOUBLE PAY'
         );
@@ -62,7 +71,7 @@ router.get('/performance', async (req, res) => {
             m.mistake_type !== 'MONEY SHORT' && m.mistake_type !== 'DOUBLE PAY'
         );
 
-        // 3. Calculation Logic
+        // --- 3. CALCULATION ENGINE ---
         const totalOrders = orderData.reduce((sum, o) => sum + (Number(o.order_count) || 0), 0);
         const generalMistakesCount = generalMistakes.reduce((sum, m) => sum + (Number(m.count) || 0), 0);
         
@@ -75,7 +84,7 @@ router.get('/performance', async (req, res) => {
         // Score: Total Orders - Total Mistakes
         const overallPerformance = totalOrders - totalMistakesCalculated;
 
-        // 4. Response
+        // --- 4. RESPONSE ---
         res.json({
             success: true,
             employeeName: orderData[0]?.employee_name || rawMistakeData[0]?.employee_name || "N/A",

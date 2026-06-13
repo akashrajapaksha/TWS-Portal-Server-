@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const supabase = require('../supabaseClient');
+const db = require('../db'); // Assumes your pool connection configuration is exported here
 
 /**
  * 🔐 AUTH MIDDLEWARE
@@ -23,30 +23,24 @@ const authorize = (allowedRoles) => {
 
 /**
  * 🛠 REUSABLE DATA FETCHER
- * Fetches from both tables, applies optional filters, merges, and sorts.
+ * Merges records from both application tables and sorts by latest apply_date using SQL UNION.
  */
 const getCombinedLeaveLogs = async (employeeId = null) => {
-    // Define queries for both tables
-    let query1 = supabase.from('leave_applications').select('*');
-    let query2 = supabase.from('leave_applications_two').select('*');
+    let sql = `
+        SELECT * FROM leave_applications
+        ${employeeId ? 'WHERE employee_id = ?' : ''}
+        UNION ALL
+        SELECT * FROM leave_applications_two
+        ${employeeId ? 'WHERE employee_id = ?' : ''}
+        ORDER BY apply_date DESC
+    `;
 
-    // If an employeeId is provided, apply the filter to both queries
-    if (employeeId) {
-        query1 = query1.eq('employee_id', employeeId);
-        query2 = query2.eq('employee_id', employeeId);
-    }
+    // Map parameters based on whether an employeeId filter is active
+    const params = employeeId ? [employeeId, employeeId] : [];
 
-    // Execute both queries in parallel for better performance
-    const [res1, res2] = await Promise.all([query1, query2]);
-
-    // Error handling
-    if (res1.error) throw res1.error;
-    if (res2.error) throw res2.error;
-
-    // Merge arrays and sort by apply_date (Descending - Latest first)
-    return [...(res1.data || []), ...(res2.data || [])].sort((a, b) => 
-        new Date(b.apply_date) - new Date(a.apply_date)
-    );
+    // Execute using mysql2/promise pool structure
+    const [rows] = await db.execute(sql, params);
+    return rows;
 };
 
 /**
@@ -62,7 +56,11 @@ router.get('/all-logs', authorize(['Super Admin', 'ER']), async (req, res) => {
         });
     } catch (err) {
         console.error('Fetch Error:', err.message);
-        res.status(500).json({ success: false, message: "දත්ත ලබා ගැනීමට නොහැකි විය.", error: err.message });
+        res.status(500).json({ 
+            success: false, 
+            message: "Failed to retrieve leave log records from the database.", 
+            error: err.message 
+        });
     }
 });
 
@@ -80,7 +78,11 @@ router.get('/search/:empId', authorize(['Super Admin', 'ER']), async (req, res) 
         });
     } catch (err) {
         console.error('Search Error:', err.message);
-        res.status(500).json({ success: false, message: "සෙවුම අසාර්ථක විය.", error: err.message });
+        res.status(500).json({ 
+            success: false, 
+            message: "Search operation failed due to a database processing error.", 
+            error: err.message 
+        });
     }
 });
 

@@ -1,22 +1,25 @@
 const express = require('express');
 const router = express.Router();
-const supabase = require('../supabaseClient'); 
+const db = require('../db'); // Your working MySQL Client Pool configuration
 
 // @route   POST /api/feedback/submit
 router.post('/submit', async (req, res) => {
     const { employee_id, employee_name, category, description } = req.body;
+    
     try {
-        const { error } = await supabase
-            .from('feedback')
-            .insert([{ 
-                employee_id, 
-                employee_name, 
-                category, 
-                description,
-                status: 'pending' 
-            }]);
+        const mysqlQuery = `
+            INSERT INTO feedback 
+            (employee_id, employee_name, category, description, status) 
+            VALUES (?, ?, ?, ?, 'pending')
+        `;
 
-        if (error) throw error;
+        await db.execute(mysqlQuery, [
+            employee_id || null,
+            employee_name || null,
+            category || null,
+            description || null
+        ]);
+
         res.status(200).json({ success: true, message: "Feedback submitted successfully" });
     } catch (error) {
         console.error("❌ Feedback Submission Error:", error.message);
@@ -27,13 +30,12 @@ router.post('/submit', async (req, res) => {
 // @route   GET /api/feedback/all
 router.get('/all', async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('feedback')
-            .select('*')
-            .order('created_at', { ascending: false });
+        // Fetching records ordered by submission time from newest to oldest
+        const [rows] = await db.execute(
+            "SELECT * FROM feedback ORDER BY created_at DESC"
+        );
 
-        if (error) throw error;
-        res.json(data);
+        res.json(rows);
     } catch (error) {
         console.error("❌ Feedback Fetch Error:", error.message);
         res.status(500).json({ success: false, error: error.message });
@@ -45,20 +47,24 @@ router.patch('/mark-as-read/:id', async (req, res) => {
     const { id } = req.params;
 
     try {
-        // Ensure id is treated as a number if your DB uses BigInt/Integer
-        const numericId = parseInt(id);
+        // Convert route param to a standard integer to match MySQL AUTO_INCREMENT keys
+        const numericId = parseInt(id, 10);
+        if (isNaN(numericId)) {
+            return res.status(400).json({ success: false, error: "Invalid feedback ID format." });
+        }
 
-        const { data, error, status } = await supabase
-            .from('feedback')
-            .update({ status: 'read' }) 
-            .eq('id', isNaN(numericId) ? id : numericId); // Handles both UUID strings and Integers
+        const [result] = await db.execute(
+            "UPDATE feedback SET status = 'read' WHERE id = ?",
+            [numericId]
+        );
 
-        if (error) throw error;
+        // Check if a row actually matched the ID sent by the client
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ success: false, message: "Feedback record not found." });
+        }
 
-        // Note: Supabase update doesn't throw error if ID isn't found, 
-        // it just returns an empty array or status 204.
         res.json({ success: true, message: "Feedback marked as read" });
-    } catch (error) {
+    } catch (error) {m
         console.error("❌ Feedback Update Error:", error.message);
         res.status(500).json({ success: false, error: error.message });
     }

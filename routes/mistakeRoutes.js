@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const supabase = require('../supabaseClient');
+const mysqlPool = require('../db'); // ✅ Swapped Supabase for local MySQL connection pool
 
 /**
  * LOGIC CONSTANTS
@@ -55,21 +55,20 @@ router.get('/fetch-by-id/:id', async (req, res) => {
         const { id } = req.params;
         const cleanId = id.trim().toUpperCase();
 
-        const { data, error } = await supabase
-            .from('employees')
-            .select('name, designation, project')
-            .eq('employee_id', cleanId)
-            .single();
+        const [rows] = await mysqlPool.query(
+            'SELECT name, designation, project FROM employees WHERE employee_id = ? LIMIT 1',
+            [cleanId]
+        );
 
-        if (error || !data) {
+        if (rows.length === 0) {
             return res.status(404).json({ success: false, message: "Employee not found" });
         }
 
         return res.json({
             success: true,
-            name: data.name,
-            designation: data.designation,
-            project: data.project
+            name: rows[0].name,
+            designation: rows[0].designation,
+            project: rows[0].project
         });
     } catch (err) {
         return res.status(500).json({ success: false, error: "Internal Server Error" });
@@ -89,32 +88,41 @@ router.post('/add', async (req, res) => {
         }
 
         const cleanData = processMistakeData(req.body);
-        const { data, error } = await supabase
-            .from('mistakes')
-            .insert([{ 
-                employeeid: cleanData.employeeid.trim().toUpperCase(), 
-                employee_name: cleanData.employee_name, 
-                project: cleanData.project, 
-                employee_position: cleanData.employee_position, 
-                date: cleanData.date, 
-                shift: cleanData.shift, 
-                mistake_type: cleanData.mistake_type, 
-                amount: cleanData.amount,
-                count: cleanData.count 
-            }])
-            .select();
 
-        if (error) throw error;
+        // Step A: Insert into local MySQL 'mistakes' table
+        const [insertResult] = await mysqlPool.query(
+            `INSERT INTO mistakes 
+            (employeeid, employee_name, project, employee_position, date, shift, mistake_type, amount, count) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                cleanData.employeeid.trim().toUpperCase(),
+                cleanData.employee_name,
+                cleanData.project,
+                cleanData.employee_position,
+                cleanData.date,
+                cleanData.shift,
+                cleanData.mistake_type,
+                cleanData.amount,
+                cleanData.count
+            ]
+        );
 
-        await supabase.from('other_logs').insert([{
-            employee_id: admin_id || "System",
-            employee_name: admin_name || "Admin",
-            action: "Mistake Added",
-            timestamp: new Date().toISOString(),
-            description: `Admin ${admin_name} added a '${cleanData.mistake_type}' mistake for ${cleanData.employee_name}.`
-        }]);
+        // Fetch back the created row to return to client
+        const [newRecord] = await mysqlPool.query('SELECT * FROM mistakes WHERE id = ?', [insertResult.insertId]);
 
-        res.status(201).json({ success: true, mistake: data[0] });
+        // Step B: Write Audit Logs
+        await mysqlPool.query(
+            `INSERT INTO other_logs (employee_id, employee_name, action, timestamp, description) 
+            VALUES (?, ?, ?, NOW(), ?)`,
+            [
+                admin_id || "System",
+                admin_name || "Admin",
+                "Mistake Added",
+                `Admin ${admin_name} added a '${cleanData.mistake_type}' mistake for ${cleanData.employee_name}.`
+            ]
+        );
+
+        res.status(201).json({ success: true, mistake: newRecord[0] });
     } catch (err) {
         res.status(400).json({ success: false, error: err.message });
     }
@@ -126,6 +134,7 @@ router.post('/add', async (req, res) => {
 router.put('/:id', async (req, res) => {
     try {
         const { admin_id, admin_name, userRole } = req.body;
+        const mistakeId = req.params.id;
 
         const allowedRoles = ['Super Admin', 'Supervisors', 'TSP', 'LD'];
         if (!allowedRoles.includes(userRole)) {
@@ -133,33 +142,42 @@ router.put('/:id', async (req, res) => {
         }
 
         const cleanData = processMistakeData(req.body);
-        const { data, error } = await supabase
-            .from('mistakes')
-            .update({
-                employeeid: cleanData.employeeid.trim().toUpperCase(),
-                employee_name: cleanData.employee_name,
-                project: cleanData.project,
-                employee_position: cleanData.employee_position,
-                date: cleanData.date,
-                shift: cleanData.shift,
-                mistake_type: cleanData.mistake_type,
-                amount: cleanData.amount,
-                count: cleanData.count
-            })
-            .eq('id', req.params.id)
-            .select();
 
-        if (error) throw error;
+        // Step A: Update mistakes table
+        await mysqlPool.query(
+            `UPDATE mistakes 
+            SET employeeid = ?, employee_name = ?, project = ?, employee_position = ?, date = ?, shift = ?, mistake_type = ?, amount = ?, count = ? 
+            WHERE id = ?`,
+            [
+                cleanData.employeeid.trim().toUpperCase(),
+                cleanData.employee_name,
+                cleanData.project,
+                cleanData.employee_position,
+                cleanData.date,
+                cleanData.shift,
+                cleanData.mistake_type,
+                cleanData.amount,
+                cleanData.count,
+                mistakeId
+            ]
+        );
 
-        await supabase.from('other_logs').insert([{
-            employee_id: admin_id || "System",
-            employee_name: admin_name || "Admin",
-            action: "Mistake Updated",
-            timestamp: new Date().toISOString(),
-            description: `Mistake for ${cleanData.employee_name} updated by ${admin_name}.`
-        }]);
+        // Get the updated record
+        const [updatedRecord] = await mysqlPool.query('SELECT * FROM mistakes WHERE id = ?', [mistakeId]);
 
-        res.json({ success: true, mistake: data[0] });
+        // Step B: Log the edit action
+        await mysqlPool.query(
+            `INSERT INTO other_logs (employee_id, employee_name, action, timestamp, description) 
+            VALUES (?, ?, ?, NOW(), ?)`,
+            [
+                admin_id || "System",
+                admin_name || "Admin",
+                "Mistake Updated",
+                `Mistake for ${cleanData.employee_name} updated by ${admin_name}.`
+            ]
+        );
+
+        res.json({ success: true, mistake: updatedRecord[0] });
     } catch (err) {
         res.status(400).json({ success: false, error: err.message });
     }
@@ -170,13 +188,10 @@ router.put('/:id', async (req, res) => {
  */
 router.get('/', async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('mistakes')
-            .select('*')
-            .order('date', { ascending: false });
-
-        if (error) throw error;
-        res.json({ success: true, mistakes: data });
+        const [rows] = await mysqlPool.query(
+            'SELECT * FROM mistakes ORDER BY date DESC'
+        );
+        res.json({ success: true, mistakes: rows });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
     }
@@ -188,26 +203,27 @@ router.get('/', async (req, res) => {
 router.delete('/:id', async (req, res) => {
     try {
         const { admin_id, admin_name, emp_name, mistake_type, userRole } = req.query;
+        const mistakeId = req.params.id;
 
         const allowedRoles = ['Super Admin', 'Supervisors', 'TSP'];
         if (!allowedRoles.includes(userRole)) {
             return res.status(403).json({ success: false, message: "Unauthorized to delete record." });
         }
 
-        const { error } = await supabase
-            .from('mistakes')
-            .delete()
-            .eq('id', req.params.id);
+        // Step A: Delete Row
+        await mysqlPool.query('DELETE FROM mistakes WHERE id = ?', [mistakeId]);
             
-        if (error) throw error;
-
-        await supabase.from('other_logs').insert([{
-            employee_id: admin_id || "System",
-            employee_name: admin_name || "Admin",
-            action: "Mistake Deleted",
-            timestamp: new Date().toISOString(),
-            description: `The '${mistake_type}' record of ${emp_name} was deleted by ${admin_name}.`
-        }]);
+        // Step B: Write Audit Logs
+        await mysqlPool.query(
+            `INSERT INTO other_logs (employee_id, employee_name, action, timestamp, description) 
+            VALUES (?, ?, ?, NOW(), ?)`,
+            [
+                admin_id || "System",
+                admin_name || "Admin",
+                "Mistake Deleted",
+                `The '${mistake_type}' record of ${emp_name} was deleted by ${admin_name}.`
+            ]
+        );
 
         res.json({ success: true, message: "Record deleted" });
     } catch (err) {
@@ -217,7 +233,7 @@ router.delete('/:id', async (req, res) => {
 
 /**
  * 5. POST: Promote Mistake to IR
- * NEW LOGIC: Threshold is now 6 mistakes.
+ * FIXED: Validates the logic check against the threshold minimum of 6.
  */
 router.post('/promote-to-ir', async (req, res) => {
     try {
@@ -228,41 +244,49 @@ router.post('/promote-to-ir', async (req, res) => {
             return res.status(403).json({ success: false, message: "Unauthorized to promote records." });
         }
 
-        // Updated check: Threshold changed from 3 to 6
+        // ✅ FIXED: Corrected logic check to accurately block promotion if threshold is below 6
         const currentCount = parseInt(mistake.count) || 0;
-        if (currentCount < 3) {
+        if (currentCount < 6) {
             return res.status(400).json({ 
                 success: false, 
                 message: `Mistake count is ${currentCount}. A minimum of 6 mistakes is required to issue an IR.` 
             });
         }
 
-        const { data: irData, error: irError } = await supabase
-            .from('incident_reports')
-            .insert([{
-                full_name: mistake.employee_name,
-                emp_no: String(mistake.employeeid).trim().toUpperCase(),
-                incident_details: `[PROMOTED FROM MISTAKE]: ${mistake.mistake_type} (Total Cases: ${currentCount})`,
-                incident_date: mistake.date,
-                amount: parseFloat(mistake.amount || 0),
-                status: 'created',
-                admin_id: String(admin_id),
-                position: mistake.employee_position || 'General Staff',
-                description: `Automatically generated IR based on high mistake volume (6+) logged by ${admin_name}.`
-            }])
-            .select();
+        // Step A: Insert incident report into your MySQL architecture
+        const [irInsertResult] = await mysqlPool.query(
+            `INSERT INTO incident_reports 
+            (full_name, emp_no, incident_details, incident_date, amount, status, admin_id, position, description) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                mistake.employee_name,
+                String(mistake.employeeid).trim().toUpperCase(),
+                `[PROMOTED FROM MISTAKE]: ${mistake.mistake_type} (Total Cases: ${currentCount})`,
+                mistake.date,
+                parseFloat(mistake.amount || 0),
+                'created',
+                String(admin_id),
+                mistake.employee_position || 'General Staff',
+                `Automatically generated IR based on high mistake volume (6+) logged by ${admin_name}.`
+            ]
+        );
 
-        if (irError) throw irError;
+        // Fetch new incident report row
+        const [newIR] = await mysqlPool.query('SELECT * FROM incident_reports WHERE id = ?', [irInsertResult.insertId]);
 
-        await supabase.from('other_logs').insert([{
-            employee_id: admin_id || "System",
-            employee_name: admin_name || "Admin",
-            action: "MISTAKE_PROMOTED_TO_IR",
-            timestamp: new Date().toISOString(),
-            description: `Admin ${admin_name} promoted mistake log of ${mistake.employee_name} to an official IR. Final count: ${currentCount}.`
-        }]);
+        // Step B: Write Promotion Log Entry
+        await mysqlPool.query(
+            `INSERT INTO other_logs (employee_id, employee_name, action, timestamp, description) 
+            VALUES (?, ?, ?, NOW(), ?)`,
+            [
+                admin_id || "System",
+                admin_name || "Admin",
+                "MISTAKE_PROMOTED_TO_IR",
+                `Admin ${admin_name} promoted mistake log of ${mistake.employee_name} to an official IR. Final count: ${currentCount}.`
+            ]
+        );
 
-        res.status(201).json({ success: true, message: "IR successfully issued (Threshold of 6 reached)", data: irData[0] });
+        res.status(201).json({ success: true, message: "IR successfully issued (Threshold of 6 reached)", data: newIR[0] });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
     }

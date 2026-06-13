@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const supabase = require('./supabaseClient');
-const mysqlPool = require('./mysqlClient'); // ✅ NEW
+const mysqlPool = require('./db'); // Only using our local MySQL client now
 
 // --- ROUTE IMPORTS ---
 const authRoutes = require('./routes/authRoutes');
@@ -13,7 +12,7 @@ const projectRoutes = require('./routes/projectRoutes');
 const mistakeRoutes = require('./routes/mistakeRoutes');
 const irRoutes = require('./routes/irRoutes');
 const warningRoutes = require('./routes/warningRoutes');
-const analyticsRoutes = require('./routes/analyticsRoutes'); // ✅ NEW: For the Analyzing.tsx component
+const analyticsRoutes = require('./routes/analyticsRoutes'); 
 const reportRoutes = require('./routes/reportRoutes');
 const leaveRoutes = require('./routes/leaveRoutes');
 const leaveLOGRoutes = require("./routes/leaveLOGRoutes");
@@ -53,32 +52,31 @@ app.use(cors({
 // --- 3. GLOBAL MIDDLEWARE ---
 app.use(express.json());
 
-// --- 4. UPDATED HEALTH CHECK ---
+// --- 4. HEALTH CHECK (CLEANED UP TO USE MYSQL ONLY) ---
 app.get('/api/test-connection', async (req, res) => {
     try {
-        // Test Supabase
-        const { count } = await supabase.from('employees').select('*', { count: 'exact', head: true });
+        // Test primary database table to count employees locally
+        const [empRows] = await mysqlPool.query('SELECT COUNT(*) AS count FROM employees');
         
-        // Test MySQL
-        const [mysqlResult] = await mysqlPool.query('SELECT 1 + 1 AS solution');
+        // Test secondary database table (attendance)
+        const [attendanceResult] = await mysqlPool.query('SELECT 1 + 1 AS solution');
         
         res.json({ 
             success: true, 
-            message: "All Databases Connected", 
-            supabaseRows: count || 0,
-            mysqlStatus: mysqlResult ? "Online" : "Offline"
+            message: "Local XAMPP MySQL Instances Connected", 
+            primaryDatabaseRows: empRows[0]?.count || 0,
+            attendanceStatus: attendanceResult ? "Online" : "Offline"
         });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
     }
 });
 
-
 // --- 5. REGISTERED ROUTES ---
 app.use('/api/auth', authRoutes);
 app.use('/api/employees', employeeRoutes);
 app.use('/api/dashboard', dashboardRoutes);
-app.use('/api/analytics', analyticsRoutes); // ✅ NEW: Handles the performance cross-referencing
+app.use('/api/analytics', analyticsRoutes); 
 app.use('/api/orders', orderRoutes);
 app.use('/api/mistakes', mistakeRoutes);
 app.use('/api/ir', irRoutes);
@@ -118,7 +116,7 @@ app.listen(PORT, async () => {
     console.log(`
     🚀 TWS PORTAL BACKEND: ONLINE
     --------------------------------------------
-    📡 Local:             http://localhost:${PORT}
+    局 Local:         http://localhost:${PORT}
     📊 Analytics API:     http://localhost:${PORT}/api/analytics
     --------------------------------------------
     `);

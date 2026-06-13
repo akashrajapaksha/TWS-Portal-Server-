@@ -1,10 +1,10 @@
 const express = require('express');
 const router = express.Router();
-const supabase = require('../supabaseClient');
+const db = require('../db'); // ✅ Pointing to your local MySQL Client
 
 /**
  * AUTH MIDDLEWARE
- * Enforces the permissions from your hierarchy spreadsheet.
+ * Enforces the permissions from your hierarchy configuration.
  */
 const authorize = (allowedRoles) => {
     return (req, res, next) => {
@@ -21,22 +21,15 @@ const authorize = (allowedRoles) => {
 
 /**
  * HELPER: Clean Incoming Data
- * Fixes the "invalid input syntax" for dates and numbers.
+ * Ensures variables comply with standard column types.
  */
 const sanitizeDepartmentData = (data) => {
     const cleaned = { ...data };
-    
-    // Convert empty date strings to null so Postgres doesn't crash
-    const dateFields = ['created_date']; 
-    dateFields.forEach(field => {
-        if (cleaned[field] === "") cleaned[field] = null;
-    });
 
-    // Ensure employees_count is always a valid integer
     if (cleaned.employees_count === "" || cleaned.employees_count === undefined) {
         cleaned.employees_count = 0;
     } else {
-        cleaned.employees_count = parseInt(cleaned.employees_count) || 0;
+        cleaned.employees_count = parseInt(cleaned.employees_count, 10) || 0;
     }
 
     return cleaned;
@@ -46,13 +39,10 @@ const sanitizeDepartmentData = (data) => {
 // PERMISSION: Super Admin, Supervisors, ER, Admin, TSP
 router.get('/', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin', 'TSP']), async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('departments')
-            .select('*')
-            .order('name', { ascending: true });
-
-        if (error) throw error;
-        res.json({ success: true, departments: data });
+        const queryStr = 'SELECT * FROM departments ORDER BY name ASC';
+        const [rows] = await db.query(queryStr);
+        
+        res.json({ success: true, departments: rows });
     } catch (err) {
         console.error("❌ Fetch Error:", err.message);
         res.status(500).json({ success: false, message: "Could not fetch departments." });
@@ -60,7 +50,7 @@ router.get('/', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin', 'TSP']),
 });
 
 // 2. POST: Add new department
-// PERMISSION: Super Admin, Supervisors, ER, Admin (Creation and update only)
+// PERMISSION: Super Admin, Supervisors, ER, Admin
 router.post('/add', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin']), async (req, res) => {
     try {
         const { name, status, employee_id, employee_name } = req.body;
@@ -75,23 +65,33 @@ router.post('/add', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin']), as
             employees_count: 0
         });
 
-        const { data: deptData, error: deptError } = await supabase
-            .from('departments')
-            .insert([insertData])
-            .select();
+        // Insert new department record
+        const insertQuery = `
+            INSERT INTO departments (name, status, employees_count) 
+            VALUES (?, ?, ?)
+        `;
+        const [insertResult] = await db.query(insertQuery, [
+            insertData.name, 
+            insertData.status, 
+            insertData.employees_count
+        ]);
 
-        if (deptError) throw deptError;
+        // Fetch newly created department to emulate PostgREST return structure
+        const [newDeptRows] = await db.query('SELECT * FROM departments WHERE id = ?', [insertResult.insertId]);
 
-        // Log action in English
-        await supabase.from('other_logs').insert([{
-            employee_id: employee_id || "System",
-            employee_name: employee_name || "Admin",
-            action: "Department Added",
-            timestamp: new Date().toISOString(),
-            description: `New department '${name}' was successfully created.`
-        }]);
+        // Log action inside other_logs table context
+        const logQuery = `
+            INSERT INTO other_logs (employee_id, employee_name, action, timestamp, description) 
+            VALUES (?, ?, ?, NOW(), ?)
+        `;
+        await db.query(logQuery, [
+            employee_id || "System",
+            employee_name || "Admin",
+            "Department Added",
+            `New department '${name}' was successfully created.`
+        ]);
 
-        res.status(201).json({ success: true, department: deptData[0] });
+        res.status(201).json({ success: true, department: newDeptRows[0] });
     } catch (err) {
         console.error("❌ Add Error:", err.message);
         res.status(400).json({ success: false, message: err.message });
@@ -99,32 +99,43 @@ router.post('/add', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin']), as
 });
 
 // 3. PUT: Update department
-// PERMISSION: Super Admin, Supervisors, ER, Admin (Creation and update only)
+// PERMISSION: Super Admin, Supervisors, ER, Admin
 router.put('/:id', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin']), async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, status, employee_id, employee_name, ...otherData } = req.body;
+        const { name, status, employee_id, employee_name, employees_count } = req.body;
 
-        const updateData = sanitizeDepartmentData({ name, status, ...otherData });
+        const updateData = sanitizeDepartmentData({ name, status, employees_count });
 
-        const { data: deptData, error: deptError } = await supabase
-            .from('departments')
-            .update(updateData)
-            .eq('id', id)
-            .select();
+        // Execute update command syntax
+        const updateQuery = `
+            UPDATE departments 
+            SET name = ?, status = ?, employees_count = ? 
+            WHERE id = ?
+        `;
+        await db.query(updateQuery, [
+            updateData.name, 
+            updateData.status, 
+            updateData.employees_count, 
+            id
+        ]);
 
-        if (deptError) throw deptError;
+        // Fetch newly modified department profile state context
+        const [updatedRows] = await db.query('SELECT * FROM departments WHERE id = ?', [id]);
 
-        // Log action in English
-        await supabase.from('other_logs').insert([{
-            employee_id: employee_id || "System",
-            employee_name: employee_name || "Admin",
-            action: "Department Updated",
-            timestamp: new Date().toISOString(),
-            description: `Department '${name}' was updated to status: ${status}.`
-        }]);
+        // Log action trace entries
+        const logQuery = `
+            INSERT INTO other_logs (employee_id, employee_name, action, timestamp, description) 
+            VALUES (?, ?, ?, NOW(), ?)
+        `;
+        await db.query(logQuery, [
+            employee_id || "System",
+            employee_name || "Admin",
+            "Department Updated",
+            `Department '${name}' was updated to status: ${status}.`
+        ]);
 
-        res.json({ success: true, department: deptData[0] });
+        res.json({ success: true, department: updatedRows[0] });
     } catch (err) {
         console.error("❌ Update Error:", err.message);
         res.status(400).json({ success: false, message: err.message });
@@ -132,7 +143,7 @@ router.put('/:id', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin']), asy
 });
 
 // 4. DELETE: Remove department
-// PERMISSION: Super Admin, Supervisors, ER (Admin is excluded from delete)
+// PERMISSION: Super Admin, Supervisors, ER
 router.delete('/:id', authorize(['Super Admin', 'Supervisors', 'ER']), async (req, res) => {
     try {
         const { id } = req.params;
@@ -140,21 +151,20 @@ router.delete('/:id', authorize(['Super Admin', 'Supervisors', 'ER']), async (re
         
         if (!id) return res.status(400).json({ success: false, message: "ID is required." });
 
-        const { error: deleteError } = await supabase
-            .from('departments')
-            .delete()
-            .eq('id', id);
+        const deleteQuery = 'DELETE FROM departments WHERE id = ?';
+        await db.query(deleteQuery, [id]);
 
-        if (deleteError) throw deleteError;
-
-        // Log action in English
-        await supabase.from('other_logs').insert([{
-            employee_id: employee_id || "System",
-            employee_name: employee_name || "Admin",
-            action: "Department Deleted",
-            timestamp: new Date().toISOString(),
-            description: `Department '${dept_name || id}' was permanently removed.`
-        }]);
+        // Log record tracking entries safely
+        const logQuery = `
+            INSERT INTO other_logs (employee_id, employee_name, action, timestamp, description) 
+            VALUES (?, ?, ?, NOW(), ?)
+        `;
+        await db.query(logQuery, [
+            employee_id || "System",
+            employee_name || "Admin",
+            "Department Deleted",
+            `Department '${dept_name || id}' was permanently removed.`
+        ]);
 
         res.json({ success: true, message: "Department deleted successfully." });
     } catch (err) {

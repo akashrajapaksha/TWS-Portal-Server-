@@ -1,14 +1,12 @@
-const { createClient } = require('@supabase/supabase-js');
-require('dotenv').config();
+// ⚠️ Temporary placeholder to prevent boot crashes while migrating routes to MySQL
+console.log("⚠️ Warning: Code is still attempting to require('supabaseClient').");
 
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY;
-
-if (!supabaseUrl || !supabaseServiceKey) {
-    console.error("❌ ERROR: Supabase credentials missing in .env");
-    process.exit(1);
-}
-
-const supabase = createClient(supabaseUrl, supabaseServiceKey);
-
-module.exports = supabase;
+// Export a dummy object so routes importing it don't immediately throw 'undefined' errors
+module.exports = {
+    from: () => ({
+        select: () => ({ data: [], error: null }),
+        insert: () => ({ data: [], error: null }),
+        update: () => ({ data: [], error: null }),
+        delete: () => ({ data: [], error: null }),
+    })
+};

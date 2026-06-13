@@ -1,24 +1,26 @@
-const mysql = require('mysql2/promise'); // Correct: This allows for await db.query()
+const mysql = require('mysql2/promise'); 
 require('dotenv').config();
 
 const pool = mysql.createPool({
     host: process.env.MYSQL_HOST || 'localhost',
     user: process.env.MYSQL_USER || 'root',
     password: process.env.MYSQL_PASSWORD || '',
-    database: process.env.MYSQL_DATABASE || 'attendance', // Verified database name from image_95ce93.jpg
+    database: process.env.MYSQL_DATABASE || 'portal', 
+    port: process.env.MYSQL_PORT || 3306,
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0,
     enableKeepAlive: true,
     keepAliveInitialDelay: 0,
-    // Add these to prevent common JDM/Import character set issues if you use Japanese text
     charset: 'utf8mb4' 
 });
 
-// Testing the connection on startup to catch errors immediately
+// Testing the connection on startup
 pool.getConnection()
     .then(connection => {
-        console.log('✅ Connected to MySQL Database: ' + (process.env.MYSQL_DATABASE || 'attendance'));
+        console.log('✅ Connected to MySQL Server instance.');
+        console.log('   Primary DB:', process.env.MYSQL_DATABASE || 'your_primary_db_name');
+        console.log('   Secondary DB: attendance (Accessible via queries)');
         connection.release();
     })
     .catch(err => {
