@@ -19,7 +19,7 @@ router.get('/fetch-by-id/:id', async (req, res) => {
         const { id } = req.params;
         
         const [rows] = await mysqlPool.query(
-            `SELECT name, initials, designation FROM employees WHERE employee_id = ? LIMIT 1`,
+            `SELECT name, designation FROM employees WHERE employee_id = ? LIMIT 1`,
             [id.trim().toUpperCase()]
         );
 
@@ -31,7 +31,6 @@ router.get('/fetch-by-id/:id', async (req, res) => {
         return res.json({
             success: true,
             name: employee.name,
-            initials: employee.initials || '',
             position: employee.designation || 'Staff' 
         });
     } catch (err) {
@@ -49,7 +48,11 @@ router.get('/', async (req, res) => {
         const { userRole, loggedInEmployeeId, searchId } = req.query;
 
         // --- FETCH EXISTING IRS ---
-        let irQuery = `SELECT * FROM incident_reports WHERE 1=1`;
+        // ✅ MATCHED TO SCHEMA: Selected only the 10 real table data columns
+        let irQuery = `SELECT id, full_name, emp_no, incident_details, 
+                       DATE_FORMAT(incident_date, '%Y-%m-%d') AS incident_date, 
+                       amount, status, admin_id, position, description 
+                       FROM incident_reports WHERE 1=1`;
         const irParams = [];
 
         if (userRole === 'Employees') {
@@ -69,19 +72,18 @@ router.get('/', async (req, res) => {
         
         if (privilegedRoles.includes(userRole)) {
             // --- NATIVE REPLACEMENT FOR THE RPC 'get_pending_ir_candidates' ---
-            // Aggregates mistakes grouped by day and user, fetching the associated designation metadata
             const rawPendingQuery = `
                 SELECT 
                     m.employeeid AS official_emp_no,
                     e.name AS name,
                     e.designation AS position,
-                    m.date AS mistake_date,
+                    DATE_FORMAT(m.date, '%Y-%m-%d') AS mistake_date,
                     SUM(m.count) AS total_mistake_count,
                     SUM(m.amount) AS total_amount,
                     GROUP_CONCAT(m.mistake_type SEPARATOR ', ') AS combined_mistakes
                 FROM mistakes m
                 JOIN employees e ON m.employeeid = e.employee_id
-                GROUP BY m.employeeid, m.date, e.name, e.designation
+                GROUP BY m.employeeid, DATE_FORMAT(m.date, '%Y-%m-%d'), e.name, e.designation
             `;
             
             const [pendingCandidates] = await mysqlPool.query(rawPendingQuery);
@@ -141,22 +143,22 @@ router.get('/', async (req, res) => {
 router.post('/add', async (req, res) => {
     try {
         const { 
-            fullName, nickName, initials, empNo, position, 
-            details, dateIncident, description, prevention, 
-            adminId, adminName, amount, userRole 
+            fullName, empNo, position, details, dateIncident, 
+            description, adminId, adminName, amount, userRole 
         } = req.body;
 
         if (userRole === 'Employees') return res.status(403).json({ success: false, error: "Access Denied." });
 
         // Insert new Incident Report
+        // ✅ MATCHED TO SCHEMA: Removed missing input fields from INSERT clause
         const insertIRQuery = `
             INSERT INTO incident_reports 
-            (full_name, nick_name, initials, emp_no, incident_details, incident_date, description, prevention, admin_id, position, status, amount)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'created', ?)
+            (full_name, emp_no, incident_details, incident_date, description, admin_id, position, status, amount)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'created', ?)
         `;
         const irValues = [
-            fullName, nickName || '', initials || '', String(empNo).trim().toUpperCase(),
-            details, dateIncident, description || '', prevention || '', String(adminId), position || 'General Staff', parseFloat(amount || 0)
+            fullName, String(empNo).trim().toUpperCase(), details, 
+            dateIncident, description || '', String(adminId), position || 'General Staff', parseFloat(amount || 0)
         ];
 
         const [irResult] = await mysqlPool.query(insertIRQuery, irValues);
@@ -164,10 +166,10 @@ router.post('/add', async (req, res) => {
         // Append log history
         const logQuery = `
             INSERT INTO other_logs (employee_id, employee_name, action, timestamp, description)
-            VALUES (?, ?, 'IR_ISSUED', ?, ?)
+            VALUES (?, ?, 'IR_ISSUED', NOW(), ?)
         `;
         const logValues = [
-            String(adminId), adminName || "System", new Date().toISOString(), `Official IR issued to ${fullName} (${empNo}).`
+            String(adminId), adminName || "System", `Official IR issued to ${fullName} (${empNo}).`
         ];
         await mysqlPool.query(logQuery, logValues);
 
@@ -238,10 +240,10 @@ router.post('/promote-from-mistake', async (req, res) => {
         // Logging the promotional transformation chain
         const logQuery = `
             INSERT INTO other_logs (employee_id, employee_name, action, timestamp, description)
-            VALUES (?, ?, 'IR Issued for Mistakes', ?, ?)
+            VALUES (?, ?, 'IR Issued for Mistakes', NOW(), ?)
         `;
         const logValues = [
-            String(adminId), adminName || "System", new Date().toISOString(), `Promoted mistake for ${mistake.full_name} (${mistake.emp_no}) to IR.`
+            String(adminId), adminName || "System", `Promoted mistake for ${mistake.full_name} (${mistake.emp_no}) to IR.`
         ];
         await mysqlPool.query(logQuery, logValues);
 

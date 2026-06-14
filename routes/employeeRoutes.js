@@ -1,6 +1,36 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../db'); // ✅ Import your initialized mysql2 pool
+const multer = require('multer');
+const path = require('path');
+
+/** --- MULTER CONFIGURATION FOR IMAGE UPLOADS --- **/
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, 'uploads/'); // Saves files to an 'uploads' folder in your root directory
+    },
+    filename: (req, file, cb) => {
+        // Appends timestamp to the original filename to ensure uniqueness
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+    }
+});
+
+// File filter to ensure only image assets are sent
+const fileFilter = (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+        cb(null, true);
+    } else {
+        cb(new Error('Only image files are allowed!'), false);
+    }
+};
+
+const upload = multer({ 
+    storage: storage,
+    fileFilter: fileFilter,
+    limits: { fileSize: 5 * 1024 * 1024 } // Optional limit: 5MB max
+});
+
 
 /** --- CONSTANTS --- **/
 const ROLE_HIERARCHY = {
@@ -25,14 +55,20 @@ const sanitizeEmployeeData = (data) => {
     // 1. Process date fields
     const dateFields = ['date_of_joining'];
     dateFields.forEach(field => {
-        if (cleaned[field] === "" || cleaned[field] === undefined) cleaned[field] = null;
+        if (cleaned[field] === "" || cleaned[field] === undefined || cleaned[field] === null) {
+            cleaned[field] = null;
+        }
     });
 
     // 2. Process numerical fields
     const numFields = ['annual_leave', 'casual_leave'];
     numFields.forEach(field => {
-        if (cleaned[field] !== undefined) {
-            cleaned[field] = parseInt(cleaned[field]) || 0;
+        if (cleaned[field] !== undefined && cleaned[field] !== null) {
+            if (cleaned[field] === "") {
+                delete cleaned[field]; // Leave unmodified if empty on updates
+            } else {
+                cleaned[field] = parseInt(cleaned[field], 10) || 0;
+            }
         }
     });
 
@@ -108,7 +144,7 @@ router.get('/', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin', 'TPS']),
 /**
  * 3. POST: Add Employee
  */
-router.post('/add', authorize(['Super Admin', 'Admin']), async (req, res) => {
+router.post('/add', authorize(['Super Admin', 'Admin']), upload.single('profile_image'), async (req, res) => {
     try {
         const creatorRole = req.headers['x-user-role']?.trim().toUpperCase();
         const { admin_id, admin_name, password, ...rawEmployeeData } = req.body;
@@ -135,20 +171,22 @@ router.post('/add', authorize(['Super Admin', 'Admin']), async (req, res) => {
             }
         }
 
+        // If a file was uploaded, assign the path to the profile_image column payload
+        if (req.file) {
+            employeeData.profile_image = req.file.path.replace(/\\/g, "/"); 
+        }
+
         employeeData.password = password.trim(); 
         employeeData.is_first_login = true; 
 
-        // Native injection query execution via mysql2 pool assignment context
         const [insertResult] = await db.query('INSERT INTO employees SET ?', [employeeData]);
         const newInsertedId = insertResult.insertId;
 
-        // Return the clean database object matching our safe criteria mapping
         const [newEmployeeRows] = await db.query(
             `SELECT ${SAFE_FIELDS} FROM employees WHERE id = ?`, 
             [newInsertedId]
         );
 
-        // Record operation timeline entry trace
         await db.query('INSERT INTO other_logs SET ?', [{
             employee_id: admin_id || "System",
             employee_name: admin_name || "Admin",
@@ -204,7 +242,7 @@ router.patch('/change-password', async (req, res) => {
 /**
  * 5. PUT: Update Employee Profile
  */
-router.put('/:id', authorize(['Super Admin', 'Admin']), async (req, res) => {
+router.put('/:id', authorize(['Super Admin', 'Admin']), upload.single('profile_image'), async (req, res) => {
     try {
         const { id } = req.params;
         const editorRole = req.headers['x-user-role']?.trim().toUpperCase();
@@ -218,7 +256,6 @@ router.put('/:id', authorize(['Super Admin', 'Admin']), async (req, res) => {
         const targetUser = targets[0];
         const currentTargetRole = targetUser.role.toUpperCase();
 
-        // Check explicit permission criteria boundaries
         if (editorRole !== 'SUPER ADMIN') {
             if (editorRole === 'ADMIN') {
                 if (currentTargetRole !== 'EMPLOYEES') {
@@ -227,14 +264,21 @@ router.put('/:id', authorize(['Super Admin', 'Admin']), async (req, res) => {
                 if (updateData.role && updateData.role.toUpperCase() !== 'EMPLOYEES') {
                     return res.status(403).json({ success: false, message: "Access Denied: Admins cannot assign management roles." });
                 }
-                // Clear out sensitive properties before execution if not Super Admin
                 delete updateData.two_factor_secret;
             } else {
                 return res.status(403).json({ success: false, message: "Access Denied: Unauthorized." });
             }
         }
 
-        // Apply clean payload query update string execution
+        if (req.file) {
+            updateData.profile_image = req.file.path.replace(/\\/g, "/");
+        }
+
+        // ✅ FIX: Prevent SQL crash if updateData happens to be completely empty
+        if (Object.keys(updateData).length === 0) {
+            return res.json({ success: true, message: "No operational changes detected." });
+        }
+
         await db.query('UPDATE employees SET ? WHERE id = ?', [updateData, id]);
 
         await db.query('INSERT INTO other_logs SET ?', [{
@@ -289,6 +333,29 @@ router.get('/search/:empId', authorize(['Super Admin', 'Supervisors', 'ER', 'Adm
         if (rows.length === 0) return res.status(404).json({ success: false, message: "Employee not found." });
 
         res.json({ success: true, name: rows[0].name });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+
+
+/**
+ * 8. GET: Fetch Single Employee Profile Details
+ */
+router.get('/profile/:id', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin', 'TPS']), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const [rows] = await db.query(
+            `SELECT ${SAFE_FIELDS} FROM employees WHERE id = ? LIMIT 1`,
+            [id]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ success: false, message: "Employee profile not found." });
+        }
+
+        res.json({ success: true, employee: rows[0] });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }

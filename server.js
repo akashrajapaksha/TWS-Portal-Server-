@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const mysqlPool = require('./db'); // Only using our local MySQL client now
+const path = require('path'); // 👈 Add this line at the top
 
 // --- ROUTE IMPORTS ---
 const authRoutes = require('./routes/authRoutes');
@@ -92,6 +93,7 @@ app.use('/api/logs', logRoutes);
 app.use('/api/other-logs', otherLogRoutes);
 app.use('/api/attendance', attendanceRoutes);
 app.use('/api/attendance-reports', attendanceReportsRoute);
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // --- 6. ERROR HANDLING ---
 app.use((req, res) => {

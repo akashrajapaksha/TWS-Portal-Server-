@@ -57,44 +57,73 @@ router.get('/', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin', 'TSP', '
     }
 });
 
-// 2. POST: Add new performance record + Audit Log
+// 2. POST: Add multiple performance records in bulk + Audit Log
 router.post('/add', authorize(['Super Admin', 'Supervisors', 'TSP', 'LD']), async (req, res) => {
+    // Acquire an explicit individual connection handler to safely manage transactions
+    const connection = await mysqlPool.getConnection();
     try {
         const { 
-            employee_id, employee_name, project, 
-            employee_position, date, shift, 
-            order_count, admin_id, admin_name 
+            employee_id, employee_name, project, employee_position, 
+            entries, // 👈 Expecting structural array: [{ date, shift, order_count }, ...]
+            admin_id, admin_name 
         } = req.body;
 
+        if (!entries || !Array.isArray(entries) || entries.length === 0) {
+            return res.status(400).json({ success: false, message: "Invalid payload: 'entries' must be a non-empty array." });
+        }
+
         const cleanEmployeeId = employee_id.trim().toUpperCase();
-        const parsedOrderCount = parseInt(order_count) || 0;
+        
+        // Begin ACID safe database storage transaction
+        await connection.beginTransaction();
 
-        // Step A: Insert Performance Record
-        const [insertResult] = await mysqlPool.query(
-            `INSERT INTO orders 
-            (employee_id, employee_name, project, employee_position, date, shift, order_count) 
-            VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [cleanEmployeeId, employee_name, project, employee_position, date, shift, parsedOrderCount]
-        );
+        const insertedRecords = [];
+        let totalOrdersLogged = 0;
 
-        // Fetch the newly inserted record to return it back to your frontend state seamlessly
-        const [newRecord] = await mysqlPool.query('SELECT * FROM orders WHERE id = ?', [insertResult.insertId]);
+        // Loop and write each sub-date configuration row into your system storage
+        for (const entry of entries) {
+            const parsedOrderCount = parseInt(entry.order_count) || 0;
+            totalOrdersLogged += parsedOrderCount;
 
-        // Step B: Audit Logging (Now points to your local other_logs table)
-        await mysqlPool.query(
+            const [insertResult] = await connection.query(
+                `INSERT INTO orders 
+                (employee_id, employee_name, project, employee_position, date, shift, order_count) 
+                VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                [cleanEmployeeId, employee_name, project, employee_position, entry.date, entry.shift, parsedOrderCount]
+            );
+
+            // Fetch the newly written line-item row immediately
+            const [newRecord] = await connection.query('SELECT * FROM orders WHERE id = ?', [insertResult.insertId]);
+            if (newRecord.length > 0) {
+                insertedRecords.push(newRecord[0]);
+            }
+        }
+
+        // Step B: Structural Audit Logging block tracking total logs injected
+        await connection.query(
             `INSERT INTO other_logs (employee_id, employee_name, action, timestamp, description) 
             VALUES (?, ?, ?, NOW(), ?)`,
             [
                 admin_id || "System",
                 admin_name || "Admin",
                 "Performance Added",
-                `Performance (Count: ${parsedOrderCount}) logged for ${employee_name} by ${admin_name}.`
+                `Logged ${entries.length} days of performance metrics (Total Orders: ${totalOrdersLogged}) for ${employee_name} by ${admin_name}.`
             ]
         );
 
-        res.status(201).json({ success: true, order: newRecord[0] });
+        // Commit all queued records cleanly to disk
+        await connection.commit();
+        
+        // Return bulk array elements back to your state manager seamlessly
+        res.status(201).json({ success: true, orders: insertedRecords });
     } catch (err) {
+        // Rollback transaction to protect table alignment if any row loops experience errors
+        await connection.rollback();
+        console.error("Bulk Insert Execution Crash:", err);
         res.status(400).json({ success: false, message: err.message });
+    } finally {
+        // Always return raw client connection controls back to management pool
+        connection.release();
     }
 });
 
