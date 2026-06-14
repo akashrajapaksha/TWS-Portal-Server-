@@ -14,15 +14,21 @@ const normalizeDate = (dateInput) => {
 };
 
 /**
- * Aggregates database rows into an O(1) lookup Map
+ * Aggregates database rows into a Shift-Aware O(1) lookup Map
+ * Key Pattern format: "YYYY-MM-DD:shiftname"
  */
-const aggregateToMap = (data, dateField, countField) => {
+const aggregateToMap = (data, dateField, shiftField, countField) => {
     const map = new Map();
     data?.forEach(item => {
         const dateKey = normalizeDate(item[dateField]);
+        let shiftRaw = String(item[shiftField] || 'morning').toLowerCase().trim();
+        let shiftKey = shiftRaw === 'noon' || shiftRaw === 'afternoon' ? 'noon' : (shiftRaw === 'night' ? 'night' : 'morning');
+        
         const count = parseInt(item[countField] || 0, 10);
+        
         if (dateKey) {
-            map.set(dateKey, (map.get(dateKey) || 0) + count);
+            const compoundKey = `${dateKey}:${shiftKey}`;
+            map.set(compoundKey, (map.get(compoundKey) || 0) + count);
         }
     });
     return map;
@@ -46,11 +52,9 @@ router.get('/public-search/:id', async (req, res) => {
     const cleanRequestorId = String(requestorId || '').trim().toUpperCase();
     const cleanRole = String(requestorRole || '').trim().toUpperCase();
 
-    // Define Role Permissions
     const managementRoles = ['SUPER ADMIN', 'SUPERVISORS', 'ER', 'ADMIN', 'TPS'];
     const selfOnlyRoles = ['LD', 'EMPLOYEES', 'EMPLOYEE'];
 
-    // Strict validation guard fallback
     if (selfOnlyRoles.includes(cleanRole) || cleanRole.includes('EMPLOYEE') || cleanRole === 'LD') {
         if (cleanRequestorId !== cleanId) {
             return res.status(403).json({
@@ -68,7 +72,6 @@ router.get('/public-search/:id', async (req, res) => {
     }
 
     try {
-        // Query your local MySQL instead of Supabase
         const [rows] = await mysqlPool.query(
             'SELECT name, project FROM employees WHERE employee_id = ? LIMIT 1',
             [cleanId]
@@ -107,7 +110,6 @@ router.post('/analyze', async (req, res) => {
     const managementRoles = ['SUPER ADMIN', 'SUPERVISORS', 'ER', 'ADMIN', 'TPS'];
     const selfOnlyRoles = ['LD', 'EMPLOYEES', 'EMPLOYEE'];
 
-    // Enforce dynamic checking rules safely
     if (selfOnlyRoles.includes(cleanRole) || cleanRole.includes('EMPLOYEE') || cleanRole === 'LD') {
         if (cleanRequestorId !== cleanId) {
             return res.status(403).json({ 
@@ -129,7 +131,7 @@ router.post('/analyze', async (req, res) => {
     }
 
     try {
-        // 1. Fetch Project Configuration Rules
+        // 1. Fetch Project Configuration Rules Matrix
         const [projRows] = await mysqlPool.query(
             'SELECT bonus_tiers FROM projects WHERE name = ? LIMIT 1',
             [project]
@@ -139,84 +141,147 @@ router.post('/analyze', async (req, res) => {
             return res.status(404).json({ success: false, error: `Configuration rules for project '${project}' not found.` });
         }
 
-        // Parse bonus JSON tier structure out safely if kept as a string blob or native json type field
-        let bonusTiers = projRows[0].bonus_tiers;
-        if (typeof bonusTiers === 'string') {
-            try { bonusTiers = JSON.parse(bonusTiers); } catch(e) { bonusTiers = []; }
+        let targetProjectShiftRules = { morning: [], noon: [], night: [] };
+        let bonusTiersRaw = projRows[0].bonus_tiers;
+        if (typeof bonusTiersRaw === 'string') {
+            try { 
+                const parsedTiers = JSON.parse(bonusTiersRaw); 
+                if (parsedTiers && (parsedTiers.morning || parsedTiers.noon || parsedTiers.night)) {
+                    targetProjectShiftRules = parsedTiers;
+                }
+            } catch(e) { 
+                console.warn("Parsing bonus_tiers layout failed.");
+            }
+        } else if (bonusTiersRaw && typeof bonusTiersRaw === 'object') {
+            targetProjectShiftRules = bonusTiersRaw;
         }
 
-        // 2. Fetch Performance Metrics Concurrently using Promise.all on local pool
+        // 2. Fetch Performance Metrics Concurrently
         const [exclusionsRes, ordersRes, mistakesRes] = await Promise.all([
             mysqlPool.query('SELECT excluded_date FROM employee_exclusions WHERE employee_id = ? AND excluded_date BETWEEN ? AND ?', [cleanId, startDate, endDate]),
-            mysqlPool.query('SELECT order_count, date FROM orders WHERE employee_id = ? AND date BETWEEN ? AND ?', [cleanId, startDate, endDate]),
-            mysqlPool.query('SELECT count, date FROM mistakes WHERE employeeid = ? AND date BETWEEN ? AND ?', [cleanId, startDate, endDate])
+            mysqlPool.query('SELECT order_count, date, shift FROM orders WHERE employee_id = ? AND date BETWEEN ? AND ?', [cleanId, startDate, endDate]),
+            mysqlPool.query('SELECT count, date, shift FROM mistakes WHERE employeeid = ? AND date BETWEEN ? AND ?', [cleanId, startDate, endDate])
         ]);
 
         const excludedSet = new Set(exclusionsRes[0]?.map(e => normalizeDate(e.excluded_date)) || []);
-        const ordersMap = aggregateToMap(ordersRes[0], 'date', 'order_count');
-        const mistakesMap = aggregateToMap(mistakesRes[0], 'date', 'count');
+        const ordersMap = aggregateToMap(ordersRes[0], 'date', 'shift', 'order_count');
+        const mistakesMap = aggregateToMap(mistakesRes[0], 'date', 'shift', 'count');
+
+        // Master variables to sum up EVERYTHING across the period
+        let totalOrdersGlobal = 0;
+        let totalMistakesGlobal = 0;
+        let activeDaysCount = 0;
+
+        // Shift isolated calculations trackers used purely for checking bonus scales
+        const shiftTotals = {
+            morning: { orders: 0, mistakes: 0, net: 0 },
+            noon:    { orders: 0, mistakes: 0, net: 0 },
+            night:   { orders: 0, mistakes: 0, net: 0 }
+        };
 
         const dailyBreakdown = [];
-        let totalOrders = 0;
-        let totalMistakes = 0;
-        let activeDaysCount = 0;
+        const shiftKeys = ['morning', 'noon', 'night'];
         
         let curr = new Date(startDate);
         const last = new Date(endDate);
 
+        // Period Date Range Loop
         while (curr <= last) {
             const dateStr = normalizeDate(curr);
             const isExcluded = excludedSet.has(dateStr);
-            const dailyOrders = ordersMap.get(dateStr) || 0;
-            const dailyMistakes = mistakesMap.get(dateStr) || 0;
-            const dailyNet = isExcluded ? 0 : (dailyOrders - (dailyMistakes * 5));
-            
+
+            let dayOrdersSum = 0;
+            let dayMistakesSum = 0;
+
+            // Gather metrics across shifts for this specific day
+            shiftKeys.forEach(shiftKey => {
+                const compoundKey = `${dateStr}:${shiftKey}`;
+                const orders = ordersMap.get(compoundKey) || 0;
+                const mistakes = mistakesMap.get(compoundKey) || 0;
+
+                dayOrdersSum += orders;
+                dayMistakesSum += mistakes;
+
+                if (!isExcluded) {
+                    shiftTotals[shiftKey].orders += orders;
+                    shiftTotals[shiftKey].mistakes += mistakes;
+                }
+            });
+
+            const dayNetScore = isExcluded ? 0 : (dayOrdersSum - (dayMistakesSum * 5));
+
             if (!isExcluded) {
-                totalOrders += dailyOrders;
-                totalMistakes += dailyMistakes;
+                totalOrdersGlobal += dayOrdersSum;
+                totalMistakesGlobal += dayMistakesSum;
                 activeDaysCount++;
             }
 
             dailyBreakdown.push({
                 date: dateStr,
-                orders: dailyOrders,
-                mistakes: dailyMistakes,
-                net: dailyNet,
+                orders: dayOrdersSum,
+                mistakes: dayMistakesSum,
+                net: dayNetScore,
                 status: isExcluded ? 'Excluded' : 'Active'
             });
 
             curr.setUTCDate(curr.getUTCDate() + 1);
         }
 
-        const totalPerformance = totalOrders - (totalMistakes * 5);
-        const tiers = Array.isArray(bonusTiers) ? bonusTiers : [];
+        // Calculate global net performance score across all worked shifts
+        const totalNetGlobal = totalOrdersGlobal - (totalMistakesGlobal * 5);
 
-        const currentTier = [...tiers]
-            .sort((a, b) => b.threshold - a.threshold) 
-            .find(t => totalPerformance >= t.threshold);
+        // 3. Process Shift Payout Bonuses & Threshold Lookups Independently
+        let combinedBonusPayout = 0;
+        const shiftViewDetails = {};
 
-        const nextTier = [...tiers]
-            .sort((a, b) => a.threshold - b.threshold) 
-            .find(t => t.threshold > totalPerformance);
+        shiftKeys.forEach(shiftKey => {
+            // Compute true shift-isolated performance metrics score for debugging/logs if needed
+            const shiftNetScore = shiftTotals[shiftKey].orders - (shiftTotals[shiftKey].mistakes * 5);
+            shiftTotals[shiftKey].net = shiftNetScore;
 
+            const rules = Array.isArray(targetProjectShiftRules[shiftKey]) ? targetProjectShiftRules[shiftKey] : [];
+            
+            // CRITICAL FIX: Evaluate the achieved milestone tier rule based on the GLOBAL net score
+            const achievedTier = [...rules]
+                .sort((a, b) => b.threshold - a.threshold)
+                .find(r => totalNetGlobal >= r.threshold);
+
+            const shiftBonus = achievedTier ? achievedTier.bonus : 0;
+            combinedBonusPayout += shiftBonus; // Accumulate shift payouts into the combined master bonus
+
+            // CRITICAL FIX: Find the next milestone threshold using the GLOBAL net score
+            const nextTier = [...rules]
+                .sort((a, b) => a.threshold - b.threshold)
+                .find(r => r.threshold > totalNetGlobal);
+
+            // Populate localized metrics data structures required by Frontend tabs
+            shiftViewDetails[shiftKey] = {
+                activeDays: activeDaysCount,
+                calculatedBonus: shiftBonus,
+                metrics: {
+                    totalOrders: totalOrdersGlobal,     // Forces matching across all shifts
+                    totalMistakes: totalMistakesGlobal, // Forces matching across all shifts
+                    totalNet: totalNetGlobal,           // Forces matching across all shifts
+                    nextTierInfo: nextTier ? {
+                        nextThreshold: nextTier.threshold,
+                        // FIX: Calculate the true remaining gap against the overall accumulated performance global net score
+                        gapToNext: nextTier.threshold - totalNetGlobal, 
+                        potentialBonus: nextTier.bonus
+                    } : null
+                }
+            };
+        });
+
+        // 4. Return summary payload structure matching layout expectations
         return res.status(200).json({
             success: true,
             summary: {
                 employeeId: cleanId,
                 employeeName,
                 project,
-                durationDays: activeDaysCount, 
-                calculatedBonus: currentTier ? currentTier.bonus : 0,
-                metrics: {
-                    totalOrders,
-                    totalMistakes,
-                    totalNet: totalPerformance,
-                    nextTierInfo: nextTier ? {
-                        nextThreshold: nextTier.threshold,
-                        gapToNext: nextTier.threshold - totalPerformance,
-                        potentialBonus: nextTier.bonus
-                    } : null
-                },
+                durationDays: activeDaysCount,
+                calculatedBonus: combinedBonusPayout, // Combined total sum of all shifts
+                shifts: shiftViewDetails,
                 dailyBreakdown
             }
         });
