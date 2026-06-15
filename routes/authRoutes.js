@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../db'); // ✅ Pointing to your local MySQL Client
+const db = require('../db'); 
 
 /**
  * 🔒 FAIL-SAFE OTPLIB IMPORT

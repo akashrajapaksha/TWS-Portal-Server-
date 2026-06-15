@@ -21,11 +21,10 @@ const authorize = (allowedRoles) => {
 };
 
 /**
- * 🧮 HELPER: Calculate Annual and Casual Balances (Aligned with Exact Schema)
+ * 🧮 HELPER: Calculate Annual and Casual Balances
  */
 const calculateRemainingBalance = async (employee_id) => {
-    // 1. Fetch base limits using your exact columns: annual_leave, casual_leave
-    // Checking against your structural text column 'employee_id'
+    // 1. Fetch base limits from the master employee profiles table
     const [empRows] = await db.execute(
         "SELECT annual_leave, casual_leave FROM employees WHERE employee_id = ? LIMIT 1",
         [employee_id]
@@ -37,7 +36,7 @@ const calculateRemainingBalance = async (employee_id) => {
     }
     const emp = empRows[0];
 
-    // 2. Fetch approved days from BOTH tables in parallel
+    // 2. Fetch approved days from BOTH leave tables in parallel
     const [res1, res2] = await Promise.all([
         db.execute(
             `SELECT leave_type, SUM(number_of_days) as total_days 
@@ -87,7 +86,7 @@ router.post('/apply', async (req, res) => {
         
         const normalizedType = leave_type.toLowerCase().trim();
         
-        // Split destinations based on target rules
+        // Split destinations based on target tables
         let targetTable = (normalizedType === 'annual' || normalizedType === 'casual') 
                         ? 'leave_applications' 
                         : 'leave_applications_two';
@@ -132,42 +131,114 @@ router.post('/apply', async (req, res) => {
 });
 
 /**
- * ✅ 2. PATCH: Approve or Reject Leave
+ * ✅ 2. PATCH: Approve or Reject Leave (Strict Admin/ER Isolation Rules + Reject Reason)
  */
-router.patch('/approve/:id', authorize(['Super Admin', 'ER']), async (req, res) => {
+router.patch('/approve/:id', authorize(['Super Admin', 'Supervisors', 'ER']), async (req, res) => {
     try {
         const { id } = req.params; 
-        const { status, admin_id, admin_name, leave_type } = req.body;
+        const { status, admin_id, admin_name, leave_type, reject_reason } = req.body;
         
         if (!leave_type) return res.status(400).json({ success: false, message: "Leave type is required to update status." });
+        if (!admin_id) return res.status(400).json({ success: false, message: "Approver Employee ID (admin_id) is required." });
         
+        const rawApproverRole = req.headers['x-user-role'];
+        const approverRole = rawApproverRole ? rawApproverRole.trim().toUpperCase() : '';
+        const currentApproverId = admin_id.trim();
+
+        // 🛡️ CONFIGURATION: Specific Authorized Employee IDs
+        const SPECIAL_TOP_ADMIN_IDS = ['EMP001', 'EMP002', '1001']; 
+        const SPECIAL_SUPERVISOR_IDS = ['EMP010', 'EMP011', 'EMP012'];
+
+        const isTopAdmin = SPECIAL_TOP_ADMIN_IDS.includes(currentApproverId);
+        const isSpecialSupervisor = SPECIAL_SUPERVISOR_IDS.includes(currentApproverId);
+
+        if (!isTopAdmin && !isSpecialSupervisor) {
+            return res.status(403).json({ 
+                success: false, 
+                message: `Access Denied: Employee ID ${currentApproverId} is not explicitly authorized to process approvals.` 
+            });
+        }
+
         const normType = leave_type.toLowerCase().trim();
         const targetTable = (normType === 'medical' || normType === 'no pay') 
                             ? 'leave_applications_two' 
                             : 'leave_applications';
 
-        const mysqlStatus = status || 'Pending';
-
-        // 1. Update the correct application table
-        await db.execute(
-            `UPDATE ${targetTable} SET status = ? WHERE id = ?`, 
-            [mysqlStatus, id]
+        // 1. Fetch the leave applicant's employee_id from the application record
+        const [applicationRows] = await db.execute(
+            `SELECT employee_id FROM ${targetTable} WHERE id = ? LIMIT 1`,
+            [id]
         );
 
-        // 2. Insert trace record inside logs
+        if (!applicationRows || applicationRows.length === 0) {
+            return res.status(404).json({ success: false, message: "Leave application record not found." });
+        }
+        const applicantEmpId = applicationRows[0].employee_id;
+
+        // 2. Look up the applicant's assigned role from the master employees records
+        const [employeeRows] = await db.execute(
+            "SELECT role FROM employees WHERE employee_id = ? LIMIT 1",
+            [applicantEmpId]
+        );
+
+        if (!employeeRows || employeeRows.length === 0) {
+            return res.status(404).json({ success: false, message: "Applicant profile context could not be found." });
+        }
+        const applicantRole = (employeeRows[0].role || '').trim().toUpperCase();
+
+        // 🛑 Strict Isolation Check
+        if (applicantRole === 'ADMIN' || applicantRole === 'ER') {
+            if (!isTopAdmin) {
+                return res.status(403).json({
+                    success: false,
+                    message: `Access Denied: Leaves from ${applicantRole} profiles can only be approved by authorized ER or Super Admin managers.`
+                });
+            }
+        }
+
+        // 3. Enforce Hierarchical Boundaries for Whitelisted Supervisors
+        if (isSpecialSupervisor && !isTopAdmin) {
+            if (approverRole !== 'SUPERVISORS') {
+                return res.status(403).json({ success: false, message: "Invalid role signature for supervisor execution." });
+            }
+
+            const allowedSubordinateRoles = ['EMPLOYEES', 'LD', 'TPS'];
+            if (!allowedSubordinateRoles.includes(applicantRole)) {
+                return res.status(403).json({ 
+                    success: false, 
+                    message: `Access Denied: Supervisors cannot approve requests for profile tier: '${applicantRole}'.` 
+                });
+            }
+        }
+
+        const mysqlStatus = status || 'Pending';
+        // Clean text input for reason or maintain fallback NULL value entries safely
+        const dynamicReason = mysqlStatus === 'Rejected' ? (reject_reason || 'No specific reason provided.') : null;
+
+        // 4. Update status AND the new reject_reason structural column fields
+        await db.execute(
+            `UPDATE ${targetTable} SET status = ?, reject_reason = ? WHERE id = ?`, 
+            [mysqlStatus, dynamicReason, id]
+        );
+
+        // 5. Log audit trails for administrative tracking
+        const descriptiveLog = mysqlStatus === 'Rejected' 
+            ? `${leave_type} leave has been Rejected. Reason: "${dynamicReason}" by Authorized ID: ${currentApproverId}.`
+            : `${leave_type} leave has been Approved by Authorized ID: ${currentApproverId}.`;
+
         await db.execute(
             "INSERT INTO other_logs (employee_id, employee_name, action, description) VALUES (?, ?, ?, ?)",
             [
-                admin_id || null,
+                admin_id,
                 admin_name || null,
                 `Leave ${mysqlStatus}`,
-                `${leave_type} leave has been ${mysqlStatus}. (ID: ${id})`
+                descriptiveLog
             ]
         );
 
         res.json({ success: true, message: `Leave status updated to ${mysqlStatus}.` });
     } catch (err) {
-        console.error("MySQL Update Error:", err.message);
+        console.error("MySQL Strict Isolation Evaluation Error:", err.message);
         res.status(500).json({ success: false, message: "Sync Error: " + err.message });
     }
 });
@@ -187,7 +258,6 @@ router.get('/my-leaves/:empId', async (req, res) => {
         const data1 = res1[0] || [];
         const data2 = res2[0] || [];
 
-        // Merge arrays and cleanly sort across fallback date properties
         const combined = [...data1, ...data2].sort((a, b) => {
             const dateA = a.apply_date || a.created_at;
             const dateB = b.apply_date || b.created_at;
@@ -201,9 +271,9 @@ router.get('/my-leaves/:empId', async (req, res) => {
 });
 
 /**
- * 👑 4. GET: All leave applications (Admin/ER View)
+ * 👑 4. GET: All leave applications (Admin/ER/Supervisor Dashboard View)
  */
-router.get('/all', authorize(['Super Admin', 'ER']), async (req, res) => {
+router.get('/all', authorize(['Super Admin', 'Supervisors', 'ER']), async (req, res) => {
     try {
         const [res1, res2] = await Promise.all([
             db.execute("SELECT * FROM leave_applications ORDER BY id DESC"),
@@ -226,29 +296,12 @@ router.get('/all', authorize(['Super Admin', 'ER']), async (req, res) => {
 });
 
 /**
- * 💰 5. GET: Get Clean Leave Balance Calculations
+ * 💰 5. GET: Clean Leave Balance Calculations
  */
 router.get('/balance/:empId', async (req, res) => {
     try {
         const { empId } = req.params;
-        const balances = await calculateRemainingBalance(empId);
         
-        res.json({ 
-            success: true, 
-            annual: balances.annual_balance, 
-            casual: balances.casual_balance 
-        });
-    } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
-    }
-});
-
-
-router.get('/balance/:empId', async (req, res) => {
-    try {
-        const { empId } = req.params;
-        
-        // 🔴 ADD THIS LOG TO YOUR TERMINAL:
         console.log("--> Backend received balance request for empId:", empId, "Type:", typeof empId);
 
         const balances = await calculateRemainingBalance(empId);
