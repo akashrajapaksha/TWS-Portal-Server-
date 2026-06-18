@@ -45,7 +45,7 @@ router.get('/fetch-by-id/:id', async (req, res) => {
 });
 
 // 1. GET: Fetch all performance records (Sorted by most recent)
-router.get('/', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin', 'TSP', 'LD']), async (req, res) => {
+router.get('/', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin', 'TPS', 'LD']), async (req, res) => {
     try {
         const [rows] = await mysqlPool.query(
             'SELECT * FROM orders ORDER BY date DESC'
@@ -58,7 +58,7 @@ router.get('/', authorize(['Super Admin', 'Supervisors', 'ER', 'Admin', 'TSP', '
 });
 
 // 2. POST: Add multiple performance records in bulk + Audit Log
-router.post('/add', authorize(['Super Admin', 'Supervisors', 'TSP', 'LD']), async (req, res) => {
+router.post('/add', authorize(['Super Admin', 'Supervisors', 'TPS', 'LD']), async (req, res) => {
     // Acquire an explicit individual connection handler to safely manage transactions
     const connection = await mysqlPool.getConnection();
     try {
@@ -128,7 +128,7 @@ router.post('/add', authorize(['Super Admin', 'Supervisors', 'TSP', 'LD']), asyn
 });
 
 // 3. PUT: Update existing record + Audit Log
-router.put('/:id', authorize(['Super Admin', 'Supervisors', 'TSP', 'LD']), async (req, res) => {
+router.put('/:id', authorize(['Super Admin', 'Supervisors', 'TPS', 'LD']), async (req, res) => {
     try {
         const { 
             employee_id, employee_name, project, 
@@ -170,7 +170,7 @@ router.put('/:id', authorize(['Super Admin', 'Supervisors', 'TSP', 'LD']), async
 });
 
 // 4. DELETE: Remove record + Audit Log
-router.delete('/:id', authorize(['Super Admin', 'Supervisors', 'TSP']), async (req, res) => {
+router.delete('/:id', authorize(['Super Admin', 'Supervisors', 'TPS']), async (req, res) => {
     try {
         const { admin_id, admin_name, emp_name } = req.query;
         const recordId = req.params.id;

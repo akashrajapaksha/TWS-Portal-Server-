@@ -1,6 +1,38 @@
 const express = require('express');
 const router = express.Router();
+const multer = require('multer');
+const path = require('path');
 const db = require('../db'); // Your working MySQL Client Pool configuration
+
+// --- 📦 MULTER FILE STORAGE CONFIGURATION ---
+const storage = multer.diskStorage({
+    destination: function (req, file, cb) {
+        cb(null, 'uploads/medical_docs/'); 
+    },
+    filename: function (req, file, cb) {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+    }
+});
+
+const fileFilter = (req, file, cb) => {
+    const allowedTypes = /jpeg|jpg|png|pdf/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+
+    if (extname && mimetype) {
+        return cb(null, true);
+    } else {
+        cb(new Error('Format rejected. Only PDF, JPG, JPEG, or PNG system files are permitted.'), false);
+    }
+};
+
+const upload = multer({ 
+    storage: storage,
+    fileFilter: fileFilter,
+    limits: { fileSize: 5 * 1024 * 1024 } 
+});
+
 
 /**
  * 🔐 AUTH MIDDLEWARE: User Role Verification
@@ -24,53 +56,57 @@ const authorize = (allowedRoles) => {
  * 🧮 HELPER: Calculate Annual and Casual Balances
  */
 const calculateRemainingBalance = async (employee_id) => {
-    // 1. Fetch base limits from the master employee profiles table
     const [empRows] = await db.execute(
         "SELECT annual_leave, casual_leave FROM employees WHERE employee_id = ? LIMIT 1",
         [employee_id]
     );
     
     if (!empRows || empRows.length === 0) {
-        console.log(`[Balance Check] No employee found matching ID: ${employee_id}`);
-        return { annual_balance: 0, casual_balance: 0 };
+        return { annual_balance: 0, casual_balance: 0, annual_total: 0, casual_total: 0 };
     }
     const emp = empRows[0];
 
-    // 2. Fetch approved days from BOTH leave tables in parallel
     const [res1, res2] = await Promise.all([
         db.execute(
-            `SELECT leave_type, SUM(number_of_days) as total_days 
+            `SELECT leave_type, NULL as deduct_from, SUM(number_of_days) as total_days 
              FROM leave_applications 
              WHERE employee_id = ? AND status = 'Approved' 
              GROUP BY leave_type`,
             [employee_id]
         ),
+        // 🔥 FIXED: Standardized case-insensitivity processing directly in SQL to prevent dropouts
         db.execute(
-            `SELECT leave_type, SUM(number_of_days) as total_days 
+            `SELECT leave_type, UPPER(TRIM(deduct_from)) as deduct_from, SUM(number_of_days) as total_days 
              FROM leave_applications_two 
-             WHERE employee_id = ? AND status = 'Approved' 
-             GROUP BY leave_type`,
+             WHERE employee_id = ? 
+               AND status IN ('Approved', 'Pending_ER_Supervisor') 
+               AND UPPER(TRIM(deduct_from)) IN ('CASUAL', 'ANNUAL')
+             GROUP BY leave_type, UPPER(TRIM(deduct_from))`,
             [employee_id]
         )
     ]);
 
-    const leaveRows1 = res1[0] || [];
-    const leaveRows2 = res2[0] || [];
-    const allLeaveRows = [...leaveRows1, ...leaveRows2];
-
+    const allLeaveRows = [...(res1[0] || []), ...(res2[0] || [])];
     let takenAnnual = 0;
     let takenCasual = 0;
 
-    // Process all aggregated rows dynamically
     allLeaveRows.forEach(row => {
-        if (!row.leave_type) return;
-        const type = row.leave_type.toLowerCase().trim();
-        if (type === 'annual') takenAnnual += parseFloat(row.total_days) || 0;
-        if (type === 'casual') takenCasual += parseFloat(row.total_days) || 0;
+        const type = row.leave_type ? row.leave_type.toLowerCase().trim() : '';
+        const deduct = row.deduct_from ? row.deduct_from.toLowerCase().trim() : 'none';
+
+        if (type === 'annual' || deduct === 'annual') {
+            takenAnnual += parseFloat(row.total_days) || 0;
+        }
+        if (type === 'casual' || deduct === 'casual') {
+            takenCasual += parseFloat(row.total_days) || 0;
+        }
     });
 
-    // 3. Return remaining balances safely
     return {
+        annual_total: emp.annual_leave || 0,
+        casual_total: emp.casual_leave || 0,
+        taken_annual: takenAnnual,
+        taken_casual: takenCasual,
         annual_balance: Math.max(0, (emp.annual_leave || 0) - takenAnnual),
         casual_balance: Math.max(0, (emp.casual_leave || 0) - takenCasual)
     };
@@ -79,189 +115,299 @@ const calculateRemainingBalance = async (employee_id) => {
 /**
  * 🚀 1. POST: Apply for Leave
  */
-router.post('/apply', async (req, res) => {
+router.post('/apply', upload.single('document'), async (req, res) => {
     try {
-        const { employee_id, employee_name, leave_type, start_date, end_date, number_of_days, reason, user_id } = req.body;
-        if (!leave_type) return res.status(400).json({ success: false, message: "Leave type is required." });
-        
+        const { 
+            employee_id, 
+            employee_name, 
+            leave_type, 
+            start_date, 
+            end_date, 
+            number_of_days, 
+            reason, 
+            user_id,
+            project_name 
+        } = req.body;
+
+        if (!leave_type || !employee_id) {
+            return res.status(400).json({ success: false, message: "Employee ID and Leave type are required." });
+        }
+
         const normalizedType = leave_type.toLowerCase().trim();
+
+        if (normalizedType === 'medical' && !req.file) {
+            return res.status(400).json({ 
+                success: false, 
+                message: "Validation Error: Medical leaves require a supporting documentation attachment file upload." 
+            });
+        }
+
+        const [userRows] = await db.execute("SELECT role FROM employees WHERE employee_id = ? LIMIT 1", [employee_id]);
+        if (!userRows || userRows.length === 0) {
+            return res.status(404).json({ success: false, message: "Applying employee context not found." });
+        }
+        const applicantRole = userRows[0].role.trim().toUpperCase();
         
-        // Split destinations based on target tables
+        let initialStatus = 'Pending_Admin'; 
+        if (applicantRole === 'ADMIN') {
+            initialStatus = 'Pending_ER_Supervisor'; 
+        } else if (applicantRole === 'ER') {
+            initialStatus = 'Pending_Supervisor'; 
+        }
+        
         let targetTable = (normalizedType === 'annual' || normalizedType === 'casual') 
                         ? 'leave_applications' 
                         : 'leave_applications_two';
 
-        const mysqlQuery = `
-            INSERT INTO ${targetTable} 
-            (employee_id, employee_name, leave_type, start_date, end_date, number_of_days, reason, user_id, status) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending')
-        `;
+        const finalProjectName = project_name && project_name.trim() ? project_name.trim() : 'GENERAL';
+        const attachmentUrl = req.file ? `/uploads/medical_docs/${req.file.filename}` : null;
+
+        let mysqlQuery = '';
+        let queryParams = [];
+
+        if (targetTable === 'leave_applications_two') {
+            mysqlQuery = `
+                INSERT INTO leave_applications_two 
+                (employee_id, employee_name, leave_type, deduct_from, start_date, end_date, number_of_days, reason, user_id, project_name, attachment_url, status, apply_date) 
+                VALUES (?, ?, ?, 'NONE', ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+            `;
+            queryParams = [employee_id, employee_name || null, leave_type, start_date || null, end_date || null, number_of_days || 0, reason || null, user_id || null, finalProjectName, attachmentUrl, initialStatus];
+        } else {
+            mysqlQuery = `
+                INSERT INTO leave_applications 
+                (employee_id, employee_name, leave_type, start_date, end_date, number_of_days, reason, user_id, project_name, status, apply_date) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+            `;
+            queryParams = [employee_id, employee_name || null, leave_type, start_date || null, end_date || null, number_of_days || 0, reason || null, user_id || null, finalProjectName, initialStatus];
+        }
         
-        const [result] = await db.execute(mysqlQuery, [
-            employee_id || null, 
-            employee_name || null, 
-            leave_type || null, 
-            start_date || null, 
-            end_date || null, 
-            number_of_days || 0, 
-            reason || null, 
-            user_id || null
-        ]);
+        const [result] = await db.execute(mysqlQuery, queryParams);
 
-        const dataOutput = [{
-            id: result.insertId,
-            employee_id,
-            employee_name,
-            leave_type,
-            start_date,
-            end_date,
-            number_of_days,
-            reason,
-            user_id,
-            status: 'Pending',
-            apply_date: new Date()
-        }];
+        if (req.io) {
+            if (initialStatus === 'Pending_Admin') {
+                req.io.to('ADMIN').emit('new_leave_notification', {
+                    message: `New leave request submitted by ${employee_name} (${finalProjectName}).`,
+                    applicant_id: employee_id
+                });
+            } else if (initialStatus === 'Pending_ER_Supervisor') {
+                req.io.to('ER').to('SUPERVISORS').emit('new_leave_notification', {
+                    message: `Admin ${employee_name} has submitted a leave request. Awaiting second-level approval.`,
+                    applicant_id: employee_id
+                });
+            } else if (initialStatus === 'Pending_Supervisor') {
+                req.io.to('SUPERVISORS').emit('new_leave_notification', {
+                    message: `ER Specialist ${employee_name} has submitted a leave request. Awaiting Supervisor approval.`,
+                    applicant_id: employee_id
+                });
+            }
+        }
 
-        res.status(201).json({ success: true, message: "Application submitted successfully!", leave: dataOutput });
-
+        res.status(201).json({ 
+            success: true, 
+            message: `Application submitted successfully. Routed status: ${initialStatus}`, 
+            applicationId: result.insertId 
+        });
     } catch (err) {
-        console.error("MySQL Insert Error:", err);
+        console.error("Application Post Routing Error:", err);
         res.status(500).json({ success: false, message: "Database Error: " + err.message });
     }
 });
 
 /**
- * ✅ 2. PATCH: Approve or Reject Leave (Strict Admin/ER Isolation Rules + Reject Reason)
+ * ✅ 2. PATCH: Unified Workflow Evaluation Action
  */
-router.patch('/approve/:id', authorize(['Super Admin', 'Supervisors', 'ER']), async (req, res) => {
+router.patch('/process-action/:id', authorize(['Admin', 'ER', 'Supervisors', 'Super Admin']), async (req, res) => {
     try {
         const { id } = req.params; 
-        const { status, admin_id, admin_name, leave_type, reject_reason } = req.body;
+        const { action_type, approver_id, approver_name, leave_type, comment, deduct_from } = req.body; 
         
-        if (!leave_type) return res.status(400).json({ success: false, message: "Leave type is required to update status." });
-        if (!admin_id) return res.status(400).json({ success: false, message: "Approver Employee ID (admin_id) is required." });
-        
+        if (!leave_type) return res.status(400).json({ success: false, message: "Leave type is required." });
+        if (!approver_id) return res.status(400).json({ success: false, message: "Approver identification context is required." });
+
         const rawApproverRole = req.headers['x-user-role'];
         const approverRole = rawApproverRole ? rawApproverRole.trim().toUpperCase() : '';
-        const currentApproverId = admin_id.trim();
-
-        // 🛡️ CONFIGURATION: Specific Authorized Employee IDs
-        const SPECIAL_TOP_ADMIN_IDS = ['EMP001', 'EMP002', '1001']; 
-        const SPECIAL_SUPERVISOR_IDS = ['EMP010', 'EMP011', 'EMP012'];
-
-        const isTopAdmin = SPECIAL_TOP_ADMIN_IDS.includes(currentApproverId);
-        const isSpecialSupervisor = SPECIAL_SUPERVISOR_IDS.includes(currentApproverId);
-
-        if (!isTopAdmin && !isSpecialSupervisor) {
-            return res.status(403).json({ 
-                success: false, 
-                message: `Access Denied: Employee ID ${currentApproverId} is not explicitly authorized to process approvals.` 
-            });
-        }
 
         const normType = leave_type.toLowerCase().trim();
-        const targetTable = (normType === 'medical' || normType === 'no pay') 
-                            ? 'leave_applications_two' 
-                            : 'leave_applications';
+        const targetTable = (normType === 'medical' || normType === 'no pay') ? 'leave_applications_two' : 'leave_applications';
 
-        // 1. Fetch the leave applicant's employee_id from the application record
-        const [applicationRows] = await db.execute(
-            `SELECT employee_id FROM ${targetTable} WHERE id = ? LIMIT 1`,
-            [id]
-        );
+        const [appRows] = await db.execute(`SELECT status, employee_id, employee_name FROM ${targetTable} WHERE id = ? LIMIT 1`, [id]);
+        if (!appRows || appRows.length === 0) return res.status(404).json({ success: false, message: "Application record missing." });
+        
+        const currentStatus = appRows[0].status;
+        const applicantId = appRows[0].employee_id;
+        const applicantName = appRows[0].employee_name;
 
-        if (!applicationRows || applicationRows.length === 0) {
-            return res.status(404).json({ success: false, message: "Leave application record not found." });
-        }
-        const applicantEmpId = applicationRows[0].employee_id;
+        let nextStatus = currentStatus;
+        let auditAction = '';
 
-        // 2. Look up the applicant's assigned role from the master employees records
-        const [employeeRows] = await db.execute(
-            "SELECT role FROM employees WHERE employee_id = ? LIMIT 1",
-            [applicantEmpId]
-        );
-
-        if (!employeeRows || employeeRows.length === 0) {
-            return res.status(404).json({ success: false, message: "Applicant profile context could not be found." });
-        }
-        const applicantRole = (employeeRows[0].role || '').trim().toUpperCase();
-
-        // 🛑 Strict Isolation Check
-        if (applicantRole === 'ADMIN' || applicantRole === 'ER') {
-            if (!isTopAdmin) {
-                return res.status(403).json({
-                    success: false,
-                    message: `Access Denied: Leaves from ${applicantRole} profiles can only be approved by authorized ER or Super Admin managers.`
-                });
+        if (action_type === 'REJECT') {
+            nextStatus = 'Rejected';
+            auditAction = 'Leave Rejected';
+            if (!comment || !comment.trim()) {
+                return res.status(400).json({ success: false, message: "A comment or reason is mandatory when rejecting requests." });
+            }
+        } else if (action_type === 'PASS_TO_ER') {
+            if (approverRole !== 'ADMIN') {
+                return res.status(403).json({ success: false, message: "Only Admin roles can pass operations onwards to ER processing rows." });
+            }
+            nextStatus = 'Pending_ER_Supervisor';
+            auditAction = 'Passed to ER Tier';
+        } else if (action_type === 'APPROVE') {
+            if (['ER', 'SUPERVISORS', 'SUPER ADMIN', 'ADMIN'].includes(approverRole)) {
+                nextStatus = 'Approved';
+                auditAction = 'Leave Approved';
+            } else {
+                return res.status(403).json({ success: false, message: "Admin accounts can only reject or pass requests to ER branches." });
             }
         }
 
-        // 3. Enforce Hierarchical Boundaries for Whitelisted Supervisors
-        if (isSpecialSupervisor && !isTopAdmin) {
-            if (approverRole !== 'SUPERVISORS') {
-                return res.status(403).json({ success: false, message: "Invalid role signature for supervisor execution." });
+        // Commit dynamic data changes to database layers
+        if (targetTable === 'leave_applications_two') {
+            // 🔥 FIXED: Strict checks to prevent empty string payloads ("") from wiping the previous choice.
+            if (deduct_from && deduct_from.trim() !== "" && deduct_from.trim().toUpperCase() !== "NONE") {
+                const chosenDeduction = deduct_from.trim().toUpperCase();
+                await db.execute(
+                    `UPDATE leave_applications_two SET status = ?, reject_reason = ?, deduct_from = ? WHERE id = ?`, 
+                    [nextStatus, comment || null, chosenDeduction, id]
+                );
+            } else {
+                // If the incoming payload has an empty, null, or missing deduct_from, DO NOT update that column.
+                await db.execute(
+                    `UPDATE leave_applications_two SET status = ?, reject_reason = ? WHERE id = ?`, 
+                    [nextStatus, comment || null, id]
+                );
             }
-
-            const allowedSubordinateRoles = ['EMPLOYEES', 'LD', 'TPS'];
-            if (!allowedSubordinateRoles.includes(applicantRole)) {
-                return res.status(403).json({ 
-                    success: false, 
-                    message: `Access Denied: Supervisors cannot approve requests for profile tier: '${applicantRole}'.` 
-                });
-            }
+        } else {
+            await db.execute(
+                `UPDATE leave_applications SET status = ?, reject_reason = ? WHERE id = ?`, 
+                [nextStatus, comment || null, id]
+            );
         }
 
-        const mysqlStatus = status || 'Pending';
-        // Clean text input for reason or maintain fallback NULL value entries safely
-        const dynamicReason = mysqlStatus === 'Rejected' ? (reject_reason || 'No specific reason provided.') : null;
-
-        // 4. Update status AND the new reject_reason structural column fields
-        await db.execute(
-            `UPDATE ${targetTable} SET status = ?, reject_reason = ? WHERE id = ?`, 
-            [mysqlStatus, dynamicReason, id]
-        );
-
-        // 5. Log audit trails for administrative tracking
-        const descriptiveLog = mysqlStatus === 'Rejected' 
-            ? `${leave_type} leave has been Rejected. Reason: "${dynamicReason}" by Authorized ID: ${currentApproverId}.`
-            : `${leave_type} leave has been Approved by Authorized ID: ${currentApproverId}.`;
-
+        const deductionNote = deduct_from ? ` (Deducted from: ${deduct_from})` : '';
         await db.execute(
             "INSERT INTO other_logs (employee_id, employee_name, action, description) VALUES (?, ?, ?, ?)",
             [
-                admin_id,
-                admin_name || null,
-                `Leave ${mysqlStatus}`,
-                descriptiveLog
+                approver_id,
+                approver_name || null,
+                auditAction,
+                `Application ID ${id} set to ${nextStatus} by ${approver_name} (${approverRole}).${deductionNote} Comment: ${comment || 'None'}`
             ]
         );
 
-        res.json({ success: true, message: `Leave status updated to ${mysqlStatus}.` });
+        if (req.io) {
+            if (action_type === 'REJECT') {
+                if (approverRole === 'ADMIN') {
+                    req.io.to(`user_${applicantId}`).emit('leave_status_changed', {
+                        message: `Your leave request has been rejected by Admin. Reason: ${comment}`
+                    });
+                } else {
+                    req.io.to(`user_${applicantId}`).to('ADMIN').emit('leave_status_changed', {
+                        message: `Leave request for ${applicantName} was rejected by ${approverRole}. Reason: ${comment}`
+                    });
+                }
+            } else if (action_type === 'PASS_TO_ER') {
+                req.io.to('ER').to('SUPERVISORS').emit('new_leave_notification', {
+                    message: `Admin passed leave request for ${applicantName} to ER processing rows.`
+                });
+            } else if (action_type === 'APPROVE') {
+                req.io.to(`user_${applicantId}`).to('ADMIN').emit('leave_status_changed', {
+                    message: `Leave request for ${applicantName} has been fully APPROVED by ${approverRole}.`
+                });
+            }
+        }
+
+        res.json({ success: true, message: `Application processed successfully. Next status state: ${nextStatus}` });
     } catch (err) {
-        console.error("MySQL Strict Isolation Evaluation Error:", err.message);
+        console.error("Workflow Update Error:", err);
         res.status(500).json({ success: false, message: "Sync Error: " + err.message });
     }
 });
 
 /**
- * 📄 3. GET: All leaves for a specific employee (Sorted newest first)
+ * 👑 3. GET: Dashboard View
+ */
+router.get('/dashboard-list', authorize(['Admin', 'ER', 'Supervisors', 'Super Admin']), async (req, res) => {
+    try {
+        const rawApproverRole = req.headers['x-user-role'];
+        const approverRole = rawApproverRole ? rawApproverRole.trim().toUpperCase() : '';
+
+        const [res1, res2] = await Promise.all([
+            db.execute("SELECT *, NULL as attachment_url, NULL as deduct_from FROM leave_applications WHERE status NOT IN ('Approved', 'Rejected')"),
+            db.execute("SELECT * FROM leave_applications_two WHERE status NOT IN ('Approved', 'Rejected')")
+        ]);
+
+        let combined = [...(res1[0] || []), ...(res2[0] || [])];
+
+        if (approverRole === 'ADMIN') {
+            combined = combined.filter(app => app.status === 'Pending_Admin');
+        } else if (approverRole === 'ER') {
+            combined = combined.filter(app => app.status === 'Pending_ER_Supervisor');
+        } else if (['SUPERVISORS', 'SUPER ADMIN'].includes(approverRole)) {
+            combined = combined.filter(app => ['Pending_ER_Supervisor', 'Pending_Supervisor'].includes(app.status));
+        }
+
+        res.json({ success: true, leaves: combined });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+/**
+ * 📊 4. GET: Analytics Context Matrix Checker
+ */
+router.get('/metrics-lookup', authorize(['Admin', 'ER', 'Supervisors', 'Super Admin']), async (req, res) => {
+    try {
+        const { target_employee_id, search_date } = req.query;
+        if (!target_employee_id || !search_date) {
+            return res.status(400).json({ success: false, message: "Missing target_employee_id or search_date query parameters." });
+        }
+
+        const balanceMetrics = await calculateRemainingBalance(target_employee_id);
+
+        const countQuery1 = `SELECT COUNT(*) as activeCount FROM leave_applications WHERE ? BETWEEN start_date AND end_date AND status = 'Approved' AND employee_id != ?`;
+        const countQuery2 = `SELECT COUNT(*) as activeCount FROM leave_applications_two WHERE ? BETWEEN start_date AND end_date AND status = 'Approved' AND employee_id != ?`;
+
+        const [countRes1, countRes2] = await Promise.all([
+            db.execute(countQuery1, [search_date, target_employee_id]),
+            db.execute(countQuery2, [search_date, target_employee_id]),
+        ]);
+
+        const totalOtherStaffOut = (countRes1[0][0].activeCount || 0) + (countRes2[0][0].activeCount || 0);
+
+        res.json({
+            success: true,
+            employeeBalances: {
+                annual_allocated: balanceMetrics.annual_total,
+                casual_allocated: balanceMetrics.casual_total,
+                annual_remaining: balanceMetrics.annual_balance,
+                casual_remaining: balanceMetrics.casual_balance,
+                total_approved_historical: balanceMetrics.taken_annual + balanceMetrics.taken_casual
+            },
+            dateAnalytics: {
+                target_date: search_date,
+                other_employees_approved_count: totalOtherStaffOut
+            }
+        });
+    } catch (err) {
+        console.error("Metrics Lookup Error:", err);
+        res.status(500).json({ success: false, message: "Lookup processing error: " + err.message });
+    }
+});
+
+/**
+ * 📄 5. GET: All leaves for a specific employee
  */
 router.get('/my-leaves/:empId', async (req, res) => {
     try {
         const { empId } = req.params;
-
         const [res1, res2] = await Promise.all([
-            db.execute("SELECT * FROM leave_applications WHERE employee_id = ? ORDER BY id DESC", [empId]),
+            db.execute("SELECT *, NULL as attachment_url, NULL as deduct_from FROM leave_applications WHERE employee_id = ? ORDER BY id DESC", [empId]),
             db.execute("SELECT * FROM leave_applications_two WHERE employee_id = ? ORDER BY id DESC", [empId])
         ]);
 
-        const data1 = res1[0] || [];
-        const data2 = res2[0] || [];
-
-        const combined = [...data1, ...data2].sort((a, b) => {
-            const dateA = a.apply_date || a.created_at;
-            const dateB = b.apply_date || b.created_at;
-            return new Date(dateB) - new Date(dateA);
+        const combined = [...(res1[0] || []), ...(res2[0] || [])].sort((a, b) => {
+            return new Date(b.apply_date || b.created_at) - new Date(a.apply_date || a.created_at);
         });
 
         res.json({ success: true, leaves: combined });
@@ -271,46 +417,13 @@ router.get('/my-leaves/:empId', async (req, res) => {
 });
 
 /**
- * 👑 4. GET: All leave applications (Admin/ER/Supervisor Dashboard View)
- */
-router.get('/all', authorize(['Super Admin', 'Supervisors', 'ER']), async (req, res) => {
-    try {
-        const [res1, res2] = await Promise.all([
-            db.execute("SELECT * FROM leave_applications ORDER BY id DESC"),
-            db.execute("SELECT * FROM leave_applications_two ORDER BY id DESC")
-        ]);
-
-        const data1 = res1[0] || [];
-        const data2 = res2[0] || [];
-
-        const allLeaves = [...data1, ...data2].sort((a, b) => {
-            const dateA = a.apply_date || a.created_at;
-            const dateB = b.apply_date || b.created_at;
-            return new Date(dateB) - new Date(dateA);
-        });
-
-        res.json({ success: true, leaves: allLeaves });
-    } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
-    }
-});
-
-/**
- * 💰 5. GET: Clean Leave Balance Calculations
+ * 💰 6. GET: Clean Balance Calculations
  */
 router.get('/balance/:empId', async (req, res) => {
     try {
         const { empId } = req.params;
-        
-        console.log("--> Backend received balance request for empId:", empId, "Type:", typeof empId);
-
         const balances = await calculateRemainingBalance(empId);
-        
-        res.json({ 
-            success: true, 
-            annual: balances.annual_balance, 
-            casual: balances.casual_balance 
-        });
+        res.json({ success: true, annual: balances.annual_balance, casual: balances.casual_balance });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }

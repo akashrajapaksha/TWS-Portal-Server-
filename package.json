@@ -30,6 +30,7 @@
     "qrcode": "^1.5.4",
     "range_check": "^4.1.0",
     "recharts": "^3.6.0",
+    "socket.io": "^4.8.3",
     "xlsx": "^0.18.5"
   }
 }

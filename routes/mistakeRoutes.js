@@ -82,7 +82,7 @@ router.post('/add', async (req, res) => {
     try {
         const { admin_id, admin_name, userRole } = req.body;
         
-        const allowedRoles = ['Super Admin', 'Supervisors', 'TSP', 'LD'];
+        const allowedRoles = ['Super Admin', 'Supervisors', 'TPS', 'LD'];
         if (!allowedRoles.includes(userRole)) {
             return res.status(403).json({ success: false, message: "Unauthorized to add records." });
         }
@@ -136,7 +136,7 @@ router.put('/:id', async (req, res) => {
         const { admin_id, admin_name, userRole } = req.body;
         const mistakeId = req.params.id;
 
-        const allowedRoles = ['Super Admin', 'Supervisors', 'TSP', 'LD'];
+        const allowedRoles = ['Super Admin', 'Supervisors', 'TPS', 'LD'];
         if (!allowedRoles.includes(userRole)) {
             return res.status(403).json({ success: false, message: "Unauthorized to update records." });
         }
@@ -205,7 +205,7 @@ router.delete('/:id', async (req, res) => {
         const { admin_id, admin_name, emp_name, mistake_type, userRole } = req.query;
         const mistakeId = req.params.id;
 
-        const allowedRoles = ['Super Admin', 'Supervisors', 'TSP'];
+        const allowedRoles = ['Super Admin', 'Supervisors', 'TPS'];
         if (!allowedRoles.includes(userRole)) {
             return res.status(403).json({ success: false, message: "Unauthorized to delete record." });
         }
@@ -239,7 +239,7 @@ router.post('/promote-to-ir', async (req, res) => {
     try {
         const { mistake, admin_id, admin_name, userRole } = req.body;
 
-        const allowedRoles = ['Super Admin', 'Supervisors', 'TSP', 'LD'];
+        const allowedRoles = ['Super Admin', 'Supervisors', 'TPS', 'LD'];
         if (!allowedRoles.includes(userRole)) {
             return res.status(403).json({ success: false, message: "Unauthorized to promote records." });
         }

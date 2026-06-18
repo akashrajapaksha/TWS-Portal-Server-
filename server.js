@@ -39,7 +39,14 @@ const allowedOrigins = [
 
 app.use(cors({
     origin: function (origin, callback) {
+        // Allow requests with no origin (like mobile apps, curl, or direct browser hits)
         if (!origin) return callback(null, true);
+        
+        // 🚀 CUSTOM WORKAROUND: Allow any dynamic temporary Cloudflare tunnel URL
+        if (origin.endsWith('.trycloudflare.com')) {
+            return callback(null, true);
+        }
+
         if (allowedOrigins.indexOf(origin) === -1) {
             return callback(new Error('CORS policy violation'), false);
         }
