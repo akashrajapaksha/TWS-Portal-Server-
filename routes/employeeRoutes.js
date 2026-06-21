@@ -67,7 +67,8 @@ const sanitizeEmployeeData = (data) => {
             if (cleaned[field] === "") {
                 delete cleaned[field]; // Leave unmodified if empty on updates
             } else {
-                cleaned[field] = parseInt(cleaned[field], 10) || 0;
+                const parsedValue = parseFloat(cleaned[field]);
+                cleaned[field] = !isNaN(parsedValue) ? parsedValue : 0;
             }
         }
     });

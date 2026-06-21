@@ -20,9 +20,9 @@ router.post('/login', async (req, res) => {
 
     try {
         // Query the local MySQL portal database
-        // ✅ UPDATED: Added profile_image to the SELECT fields
+        // ✅ UPDATED: Added designation to the SELECT fields to stop it defaulting back to role strings
         const queryStr = `
-            SELECT id, email, password, role, name, employee_id, is_first_login, two_factor_secret, profile_image 
+            SELECT id, email, password, role, designation, name, employee_id, is_first_login, two_factor_secret, profile_image 
             FROM employees 
             WHERE LOWER(TRIM(email)) = ? 
             LIMIT 1
@@ -51,10 +51,11 @@ router.post('/login', async (req, res) => {
                     id: user.id,
                     email: user.email,
                     role: user.role,
+                    designation: user.designation || user.role || 'Employees', // ✅ UPDATED: Pass designation down
                     name: user.name,
                     employee_id: employeeId,
                     is_first_login: user.is_first_login ?? false,
-                    profile_image: user.profile_image // ✅ UPDATED: Include in response payload
+                    profile_image: user.profile_image 
                 }
             });
         }
@@ -67,8 +68,7 @@ router.post('/login', async (req, res) => {
             });
         }
 
-        // Regular employees need 2FA. We pass the image back early 
-        // to cache temporarily in state if needed.
+        // Regular employees need 2FA. We pass the designation and image back early
         return res.status(200).json({
             success: true,
             require2FA: true,
@@ -76,7 +76,8 @@ router.post('/login', async (req, res) => {
                 employee_id: employeeId,
                 email: user.email,
                 name: user.name,
-                profile_image: user.profile_image // ✅ UPDATED: Pass to tempUser object state block
+                designation: user.designation || user.role || 'Employees', // ✅ UPDATED: Carry over to temp status tracking
+                profile_image: user.profile_image 
             }
         });
 
@@ -98,9 +99,9 @@ router.post('/verify-2fa', async (req, res) => {
     }
 
     try {
-        // ✅ UPDATED: Added profile_image to validation endpoint query pipeline
+        // ✅ UPDATED: Added designation to verification query payload matrix
         const queryStr = `
-            SELECT id, email, role, name, employee_id, is_first_login, two_factor_secret, profile_image 
+            SELECT id, email, role, designation, name, employee_id, is_first_login, two_factor_secret, profile_image 
             FROM employees 
             WHERE employee_id = ? 
             LIMIT 1
@@ -133,10 +134,11 @@ router.post('/verify-2fa', async (req, res) => {
                 id: user.id,
                 email: user.email,
                 role: user.role || 'Employees',
+                designation: user.designation || user.role || 'Employees', // ✅ UPDATED: Final verified payload designation injection point
                 name: user.name,
                 employee_id: user.employee_id,
                 is_first_login: user.is_first_login ?? true,
-                profile_image: user.profile_image // ✅ UPDATED: Include in successful 2FA response payload
+                profile_image: user.profile_image 
             }
         });
 

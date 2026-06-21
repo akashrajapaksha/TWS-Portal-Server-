@@ -53,6 +53,58 @@ const authorize = (allowedRoles) => {
 };
 
 /**
+ * 🛠 LOG ENGINE HELPER: Reusable Data Fetcher for Logs & Search
+ * Merges rows using UNION ALL and safely processes JSON strings for date_breakdown_matrix.
+ */
+const getCombinedLeaveLogs = async (searchTerm = null) => {
+    const filterClause = searchTerm 
+        ? `WHERE employee_id LIKE ? OR employee_name LIKE ?` 
+        : '';
+
+    let sql = `
+        SELECT 
+            id, employee_id, employee_name, leave_type, 'NONE' as deduct_from, start_date, end_date, 
+            number_of_days, reason, user_id, status, apply_date, created_at, reject_reason, 
+            project_name, NULL as attachment_url, date_breakdown_matrix 
+        FROM leave_applications
+        ${filterClause}
+        
+        UNION ALL
+        
+        SELECT 
+            id, employee_id, employee_name, leave_type, deduct_from, start_date, end_date, 
+            number_of_days, reason, user_id, status, apply_date, created_at, reject_reason, 
+            project_name, attachment_url, date_breakdown_matrix 
+        FROM leave_applications_two
+        ${filterClause}
+        
+        ORDER BY apply_date DESC
+    `;
+
+    let params = [];
+    if (searchTerm) {
+        const queryPattern = `%${searchTerm.trim()}%`;
+        params = [queryPattern, queryPattern, queryPattern, queryPattern];
+    }
+
+    const [rows] = await db.execute(sql, params);
+    
+    return rows.map(row => {
+        let parsedMatrix = null;
+        if (row.date_breakdown_matrix) {
+            try {
+                parsedMatrix = typeof row.date_breakdown_matrix === 'string' 
+                    ? JSON.parse(row.date_breakdown_matrix) 
+                    : row.date_breakdown_matrix;
+            } catch (e) {
+                parsedMatrix = [];
+            }
+        }
+        return { ...row, date_breakdown_matrix: parsedMatrix };
+    });
+};
+
+/**
  * 🧮 HELPER: Calculate Annual and Casual Balances
  */
 const calculateRemainingBalance = async (employee_id) => {
@@ -74,7 +126,6 @@ const calculateRemainingBalance = async (employee_id) => {
              GROUP BY leave_type`,
             [employee_id]
         ),
-        // 🔥 FIXED: Standardized case-insensitivity processing directly in SQL to prevent dropouts
         db.execute(
             `SELECT leave_type, UPPER(TRIM(deduct_from)) as deduct_from, SUM(number_of_days) as total_days 
              FROM leave_applications_two 
@@ -112,6 +163,49 @@ const calculateRemainingBalance = async (employee_id) => {
     };
 };
 
+// ==========================================
+// 📄 LEAVE MASTER LOGS ENDPOINTS (NEWLY ADDED)
+// ==========================================
+
+/**
+ * 📥 GET: Fetch All Master Logs
+ */
+router.get('/all-logs', authorize(['Super Admin', 'ER', 'Admin', 'Supervisors']), async (req, res) => {
+    try {
+        const logs = await getCombinedLeaveLogs();
+        res.status(200).json({
+            success: true,
+            count: logs.length,
+            logs: logs
+        });
+    } catch (err) {
+        console.error('Fetch Logs Error:', err.message);
+        res.status(500).json({ success: false, message: "Failed to fetch master leave log records.", error: err.message });
+    }
+});
+
+/**
+ * 🔍 GET: Search Logs by Name OR Employee ID
+ */
+router.get('/search/:query', authorize(['Super Admin', 'ER', 'Admin', 'Supervisors']), async (req, res) => {
+    try {
+        const { query } = req.params;
+        const logs = await getCombinedLeaveLogs(query);
+        res.status(200).json({
+            success: true,
+            count: logs.length,
+            logs: logs
+        });
+    } catch (err) {
+        console.error('Search Logs Error:', err.message);
+        res.status(500).json({ success: false, message: "Search pipeline operational failure.", error: err.message });
+    }
+});
+
+// ==========================================
+// 📝 CORE LEAVE APPLICATION ACTIONS
+// ==========================================
+
 /**
  * 🚀 1. POST: Apply for Leave
  */
@@ -121,12 +215,14 @@ router.post('/apply', upload.single('document'), async (req, res) => {
             employee_id, 
             employee_name, 
             leave_type, 
+            leave_duration_type, 
             start_date, 
             end_date, 
             number_of_days, 
             reason, 
             user_id,
-            project_name 
+            project_name,
+            date_breakdown_matrix // Added to capture your frontend grid payload
         } = req.body;
 
         if (!leave_type || !employee_id) {
@@ -134,12 +230,27 @@ router.post('/apply', upload.single('document'), async (req, res) => {
         }
 
         const normalizedType = leave_type.toLowerCase().trim();
+        const durationType = leave_duration_type || 'Full';
 
         if (normalizedType === 'medical' && !req.file) {
             return res.status(400).json({ 
                 success: false, 
                 message: "Validation Error: Medical leaves require a supporting documentation attachment file upload." 
             });
+        }
+
+        let assignedDays = durationType === 'Half' ? 0.5 : (parseFloat(number_of_days) || 0);
+
+        if (normalizedType === 'annual' || normalizedType === 'casual') {
+            const balances = await calculateRemainingBalance(employee_id);
+            const availableBalance = normalizedType === 'casual' ? balances.casual_balance : balances.annual_balance;
+            
+            if (availableBalance < assignedDays) {
+                return res.status(400).json({ 
+                    success: false, 
+                    message: `Insufficient leave balance. Requested: ${assignedDays}, Available: ${availableBalance}` 
+                });
+            }
         }
 
         const [userRows] = await db.execute("SELECT role FROM employees WHERE employee_id = ? LIMIT 1", [employee_id]);
@@ -161,24 +272,26 @@ router.post('/apply', upload.single('document'), async (req, res) => {
 
         const finalProjectName = project_name && project_name.trim() ? project_name.trim() : 'GENERAL';
         const attachmentUrl = req.file ? `/uploads/medical_docs/${req.file.filename}` : null;
+        const calculatedEndDate = durationType === 'Half' ? start_date : end_date;
 
         let mysqlQuery = '';
         let queryParams = [];
 
+        // Storing matrix arrays safely as text values dynamically inside targets
         if (targetTable === 'leave_applications_two') {
             mysqlQuery = `
                 INSERT INTO leave_applications_two 
-                (employee_id, employee_name, leave_type, deduct_from, start_date, end_date, number_of_days, reason, user_id, project_name, attachment_url, status, apply_date) 
-                VALUES (?, ?, ?, 'NONE', ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+                (employee_id, employee_name, leave_type, deduct_from, start_date, end_date, number_of_days, reason, user_id, project_name, attachment_url, status, date_breakdown_matrix, apply_date) 
+                VALUES (?, ?, ?, 'NONE', ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
             `;
-            queryParams = [employee_id, employee_name || null, leave_type, start_date || null, end_date || null, number_of_days || 0, reason || null, user_id || null, finalProjectName, attachmentUrl, initialStatus];
+            queryParams = [employee_id, employee_name || null, leave_type, start_date || null, calculatedEndDate || null, assignedDays, reason || null, user_id || null, finalProjectName, attachmentUrl, initialStatus, date_breakdown_matrix || null];
         } else {
             mysqlQuery = `
                 INSERT INTO leave_applications 
-                (employee_id, employee_name, leave_type, start_date, end_date, number_of_days, reason, user_id, project_name, status, apply_date) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+                (employee_id, employee_name, leave_type, start_date, end_date, number_of_days, reason, user_id, project_name, status, date_breakdown_matrix, apply_date) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
             `;
-            queryParams = [employee_id, employee_name || null, leave_type, start_date || null, end_date || null, number_of_days || 0, reason || null, user_id || null, finalProjectName, initialStatus];
+            queryParams = [employee_id, employee_name || null, leave_type, start_date || null, calculatedEndDate || null, assignedDays, reason || null, user_id || null, finalProjectName, initialStatus, date_breakdown_matrix || null];
         }
         
         const [result] = await db.execute(mysqlQuery, queryParams);
@@ -186,17 +299,17 @@ router.post('/apply', upload.single('document'), async (req, res) => {
         if (req.io) {
             if (initialStatus === 'Pending_Admin') {
                 req.io.to('ADMIN').emit('new_leave_notification', {
-                    message: `New leave request submitted by ${employee_name} (${finalProjectName}).`,
+                    message: `New leave request (${durationType} Day) submitted by ${employee_name} (${finalProjectName}).`,
                     applicant_id: employee_id
                 });
             } else if (initialStatus === 'Pending_ER_Supervisor') {
                 req.io.to('ER').to('SUPERVISORS').emit('new_leave_notification', {
-                    message: `Admin ${employee_name} has submitted a leave request. Awaiting second-level approval.`,
+                    message: `Admin ${employee_name} has submitted a ${durationType} Day leave request. Awaiting second-level approval.`,
                     applicant_id: employee_id
                 });
             } else if (initialStatus === 'Pending_Supervisor') {
                 req.io.to('SUPERVISORS').emit('new_leave_notification', {
-                    message: `ER Specialist ${employee_name} has submitted a leave request. Awaiting Supervisor approval.`,
+                    message: `ER Specialist ${employee_name} has submitted a ${durationType} Day leave request. Awaiting Supervisor approval.`,
                     applicant_id: employee_id
                 });
             }
@@ -261,9 +374,7 @@ router.patch('/process-action/:id', authorize(['Admin', 'ER', 'Supervisors', 'Su
             }
         }
 
-        // Commit dynamic data changes to database layers
         if (targetTable === 'leave_applications_two') {
-            // 🔥 FIXED: Strict checks to prevent empty string payloads ("") from wiping the previous choice.
             if (deduct_from && deduct_from.trim() !== "" && deduct_from.trim().toUpperCase() !== "NONE") {
                 const chosenDeduction = deduct_from.trim().toUpperCase();
                 await db.execute(
@@ -271,7 +382,6 @@ router.patch('/process-action/:id', authorize(['Admin', 'ER', 'Supervisors', 'Su
                     [nextStatus, comment || null, chosenDeduction, id]
                 );
             } else {
-                // If the incoming payload has an empty, null, or missing deduct_from, DO NOT update that column.
                 await db.execute(
                     `UPDATE leave_applications_two SET status = ?, reject_reason = ? WHERE id = ?`, 
                     [nextStatus, comment || null, id]
@@ -333,7 +443,7 @@ router.get('/dashboard-list', authorize(['Admin', 'ER', 'Supervisors', 'Super Ad
         const approverRole = rawApproverRole ? rawApproverRole.trim().toUpperCase() : '';
 
         const [res1, res2] = await Promise.all([
-            db.execute("SELECT *, NULL as attachment_url, NULL as deduct_from FROM leave_applications WHERE status NOT IN ('Approved', 'Rejected')"),
+            db.execute("SELECT *, NULL as attachment_url, 'NONE' as deduct_from FROM leave_applications WHERE status NOT IN ('Approved', 'Rejected')"),
             db.execute("SELECT * FROM leave_applications_two WHERE status NOT IN ('Approved', 'Rejected')")
         ]);
 
@@ -402,7 +512,7 @@ router.get('/my-leaves/:empId', async (req, res) => {
     try {
         const { empId } = req.params;
         const [res1, res2] = await Promise.all([
-            db.execute("SELECT *, NULL as attachment_url, NULL as deduct_from FROM leave_applications WHERE employee_id = ? ORDER BY id DESC", [empId]),
+            db.execute("SELECT *, NULL as attachment_url, 'NONE' as deduct_from FROM leave_applications WHERE employee_id = ? ORDER BY id DESC", [empId]),
             db.execute("SELECT * FROM leave_applications_two WHERE employee_id = ? ORDER BY id DESC", [empId])
         ]);
 
@@ -417,7 +527,7 @@ router.get('/my-leaves/:empId', async (req, res) => {
 });
 
 /**
- * 💰 6. GET: Clean Balance Calculations
+ * 💱 6. GET: Clean Balance Calculations
  */
 router.get('/balance/:empId', async (req, res) => {
     try {
